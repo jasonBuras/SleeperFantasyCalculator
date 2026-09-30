@@ -1101,7 +1101,8 @@ class App(tk.Tk):
         self.value_history_points = []
 
         #Trade Review compares selected players and shows each team's roster-count changes.
-        trade_tab = ttk.Frame(self.workspace, padding=12)
+        self.trade_tab = ttk.Frame(self.workspace, padding=12)
+        trade_tab = self.trade_tab
         self.workspace.add(trade_tab, text="Trade Review")
         ttk.Label(trade_tab, text="Select the players on each side to compare market values.", font=("TkDefaultFont", 11, "bold")).pack(anchor="w")
         #ttk.Label(trade_tab, text="Click a column title to sort. Names sort by last name; positions follow QB, RB, WR, TE, K.", wraplength=850).pack(anchor="w", pady=(2, 3))
@@ -1162,12 +1163,6 @@ class App(tk.Tk):
             trade_actions, text="Copy Trade Text", command=self._copy_trade_text, state="disabled"
         )
         self.copy_trade_button.pack(side="left")
-        self.copy_outcome_button = ttk.Button(
-            trade_actions, text="Copy Proposed Text", command=self._copy_trade_outcome_text, state="disabled"
-        )
-        self.copy_outcome_button.pack(side="left", padx=(8, 0))
-        ttk.Button(trade_actions, text="Mark Accepted", command=lambda: self._save_current_trade("Accepted")).pack(side="left", padx=(14, 0))
-        ttk.Button(trade_actions, text="Mark Rejected", command=lambda: self._save_current_trade("Rejected")).pack(side="left", padx=8)
         note_row = ttk.Frame(trade_tab)
         note_row.pack(fill="x", pady=(7, 0))
         ttk.Label(note_row, text="Note:").pack(side="left")
@@ -1229,7 +1224,14 @@ class App(tk.Tk):
         saved_actions = ttk.Frame(self.saved_trade_tab)
         saved_actions.pack(fill="x")
         ttk.Button(saved_actions, text="Reopen Trade", command=self._reopen_saved_trade).pack(side="left")
-        ttk.Button(saved_actions, text="Delete Saved Trade", command=self._delete_saved_trade).pack(side="left", padx=8)
+        ttk.Button(saved_actions, text="Mark Accepted", command=lambda: self._mark_saved_trade_outcome("Accepted")).pack(side="left", padx=(8, 0))
+        ttk.Button(saved_actions, text="Mark Rejected", command=lambda: self._mark_saved_trade_outcome("Rejected")).pack(side="left", padx=8)
+        ttk.Button(saved_actions, text="Mark Pending", command=lambda: self._mark_saved_trade_outcome("Proposed")).pack(side="left")
+        self.copy_outcome_button = ttk.Button(
+            saved_actions, text="Copy Proposed Text", command=self._copy_saved_trade_outcome_text, state="disabled"
+        )
+        self.copy_outcome_button.pack(side="left", padx=8)
+        ttk.Button(saved_actions, text="Delete Saved Trade", command=self._delete_saved_trade).pack(side="right")
 
         #Trade Targets lists bench-player one-for-one ideas based on reciprocal position needs.
         ideas_tab = ttk.Frame(self.workspace, padding=12)
@@ -1558,10 +1560,6 @@ class App(tk.Tk):
         self.copy_trade_button.configure(
             state="normal" if give_selection and get_selection else "disabled"
         )
-        self.copy_outcome_button.configure(
-            state="normal" if give_selection and get_selection else "disabled",
-            text=f"Copy {self._current_trade_outcome()} Text",
-        )
         give_ids = [self.trade_left_tree.item(iid, "tags")[0] for iid in give_selection]
         get_ids = [self.trade_right_tree.item(iid, "tags")[0] for iid in get_selection]
         self._update_stats_guy_trade_review(give_ids, get_ids)
@@ -1662,6 +1660,37 @@ class App(tk.Tk):
         if not give_players or not receive_players:
             return
         outcome = self._current_trade_outcome()
+        if outcome == "Accepted":
+            text = (
+                "Accepted trade\n"
+                f"I sent: {', '.join(give_players)}\n"
+                f"I received: {', '.join(receive_players)}"
+            )
+        elif outcome == "Rejected":
+            text = (
+                "Rejected trade\n"
+                f"I attempted to send: {', '.join(give_players)}\n"
+                f"I wanted to receive: {', '.join(receive_players)}"
+            )
+        else:
+            text = f"I get: {', '.join(receive_players)}\nI send: {', '.join(give_players)}"
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update()
+        self.status(f"{outcome} trade text copied to the clipboard.")
+
+    def _copy_saved_trade_outcome_text(self):
+        #Copy text for the selected saved trade using its current outcome.
+        selection = self.saved_trade_tree.selection()
+        if not selection:
+            messagebox.showinfo("Choose a Trade", "Select a saved trade before copying its text.")
+            return
+        trade = self._find_saved_trade(selection[0])
+        if not trade:
+            return
+        give_players = [asset.get("name", "Unknown player") for asset in trade.get("give_players", [])]
+        receive_players = [asset.get("name", "Unknown player") for asset in trade.get("get_players", [])]
+        outcome = trade.get("outcome", "Proposed")
         if outcome == "Accepted":
             text = (
                 "Accepted trade\n"
@@ -1919,7 +1948,7 @@ class App(tk.Tk):
                     tree.see(iid)
                     break
         self.trade_note_var.set(f"Trade idea: {idea['match']} with {idea['partner']}")
-        self.workspace.select(1)
+        self.workspace.select(self.trade_tab)
         self._update_trade_review()
 
     def _load_saved_trades(self):
@@ -2018,14 +2047,36 @@ class App(tk.Tk):
         return next((trade for trade in self._saved_trade_records()
                      if str(trade.get("id")) == str(trade_id)), None)
 
-    def _show_saved_trade_details(self, _event=None):
-        #Show each saved player, current value, side totals, and the user's note.
+    def _mark_saved_trade_outcome(self, outcome):
+        #Update the selected saved proposal's outcome without changing its players or note.
         selection = self.saved_trade_tree.selection()
         if not selection:
+            messagebox.showinfo("Choose a Trade", f"Select a saved trade to mark {outcome.lower()}.")
             return
         trade = self._find_saved_trade(selection[0])
         if not trade:
             return
+        trade["outcome"] = outcome
+        trade["updated_at"] = datetime.now().astimezone().isoformat(timespec="minutes")
+        try:
+            self._persist_saved_trades()
+        except OSError as exc:
+            messagebox.showerror("Could Not Update Trade", f"The saved trade could not be updated.\n\n{exc}")
+            return
+        self._refresh_saved_trades_view(select_id=trade["id"])
+        self.status(f"Saved trade marked {outcome.lower()}.")
+
+    def _show_saved_trade_details(self, _event=None):
+        #Show each saved player, current value, side totals, and the user's note.
+        selection = self.saved_trade_tree.selection()
+        if not selection:
+            self.copy_outcome_button.configure(state="disabled", text="Copy Proposed Text")
+            return
+        trade = self._find_saved_trade(selection[0])
+        if not trade:
+            return
+        outcome = trade.get("outcome", "Proposed")
+        self.copy_outcome_button.configure(state="normal", text=f"Copy {outcome} Text")
         def describe(side):
             lines = []
             total, complete = self._saved_trade_side_value(trade.get(side, []))
@@ -2038,7 +2089,7 @@ class App(tk.Tk):
         give_lines, give_total = describe("give_players")
         get_lines, get_total = describe("get_players")
         self.saved_trade_details.set(
-            f"Outcome: {trade.get('outcome', 'Proposed')}\n"
+            f"Outcome: {outcome}\n"
             f"Note: {trade.get('note') or '—'}\n\n"
             f"You give ({trade.get('give_team', 'Your team')}) — {give_total}\n{give_lines}\n\n"
             f"You receive ({trade.get('get_team', 'Other team')}) — {get_total}\n{get_lines}"
@@ -2151,7 +2202,7 @@ class App(tk.Tk):
             missing.extend(wanted - found)
         self.active_saved_trade_id = str(trade["id"])
         self.save_trade_button.configure(text="Update Saved Trade")
-        self.workspace.select(1)
+        self.workspace.select(self.trade_tab)
         self._update_trade_review()
         if missing:
             self.status(f"Some saved players are no longer on the selected rosters ({len(missing)}). Adjust the trade and update it if needed.")
