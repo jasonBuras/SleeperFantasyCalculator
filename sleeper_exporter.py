@@ -27,7 +27,7 @@ from openpyxl.utils import get_column_letter
 
 #This URL is the root used by Sleeper's read-only API.
 BASE_URL = "https://api.sleeper.app/v1"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 GITHUB_RELEASE_API = "https://api.github.com/repos/jasonBuras/SleeperFantasyCalculator/releases/latest"
 UPDATE_ASSET_NAME = "FantasyTradeCalculator-Windows.zip"
 
@@ -1206,6 +1206,7 @@ class App(tk.Tk):
             roster_list, columns=("slot", "position", "nfl_team", "status", "bye", "projection"),
             show="tree headings", selectmode="browse", height=8,
         )
+        self._add_tree_expand_controls(roster_controls, self.roster_tree)
         self.roster_tree.heading("#0", text="Name")
         for key, label in (("slot", "Slot"), ("position", "Position"), ("nfl_team", "NFL Team"),
                            ("status", "Status"), ("bye", "Bye"), ("projection", "Proj Points")):
@@ -1565,6 +1566,8 @@ class App(tk.Tk):
         self.attribution_labels.append(saved_credit)
         saved_credit.pack(anchor="w", pady=(0, 8))
         saved_credit.bind("<Button-1>", lambda _event: __import__("webbrowser").open("https://fantasycalc.com/"))
+        saved_tree_controls = ttk.Frame(self.saved_trade_tab)
+        saved_tree_controls.pack(fill="x", pady=(0, 4))
         self.saved_trade_tree = ttk.Treeview(
             self.saved_trade_tab,
             columns=("outcome", "give", "receive", "lean", "note", "updated"),
@@ -1581,6 +1584,7 @@ class App(tk.Tk):
         self.saved_trade_tree.column("lean", width=180)
         self.saved_trade_tree.column("note", width=180)
         self.saved_trade_tree.column("updated", width=150)
+        self._add_tree_expand_controls(saved_tree_controls, self.saved_trade_tree)
         self.saved_trade_tree.pack(fill="both", expand=True)
         self.saved_trade_tree.bind("<<TreeviewSelect>>", self._show_saved_trade_details)
         self.saved_trade_details = tk.StringVar(value="Select a saved trade to see its players.")
@@ -1635,6 +1639,7 @@ class App(tk.Tk):
         self.trade_ideas_tree.column("target", width=190)
         self.trade_ideas_tree.column("target_value", width=85, anchor="e")
         self.trade_ideas_tree.column("fit", width=110)
+        self._add_tree_expand_controls(ideas_controls, self.trade_ideas_tree)
         ideas_scroll = ttk.Scrollbar(ideas_list, orient="vertical", command=self.trade_ideas_tree.yview)
         ideas_xscroll = ttk.Scrollbar(ideas_list, orient="horizontal", command=self.trade_ideas_tree.xview)
         self.trade_ideas_tree.configure(yscrollcommand=ideas_scroll.set, xscrollcommand=ideas_xscroll.set)
@@ -1673,7 +1678,6 @@ class App(tk.Tk):
         )
         self.trade_builder_tolerance_combo.pack(side="left", padx=(8, 14))
         self.trade_builder_tolerance_combo.bind("<<ComboboxSelected>>", self._trade_builder_options_changed)
-        ttk.Button(builder_controls, text="Find Matches", command=self._build_trade_suggestions).pack(side="left")
         builder_content = ttk.Frame(builder_tab)
         builder_content.pack(fill="both", expand=True)
         builder_content.columnconfigure(0, weight=1)
@@ -1744,12 +1748,15 @@ class App(tk.Tk):
         self.trade_builder_results_tree.column("value", width=95, anchor="e")
         self.trade_builder_results_tree.column("difference", width=100, anchor="e")
         self.trade_builder_results_tree.column("fit", width=120)
+        builder_tree_controls = ttk.Frame(return_box)
+        builder_tree_controls.pack(fill="x", pady=(0, 4))
+        self._add_tree_expand_controls(builder_tree_controls, self.trade_builder_results_tree)
         results_scroll = ttk.Scrollbar(return_box, orient="vertical", command=self.trade_builder_results_tree.yview)
         self.trade_builder_results_tree.configure(yscrollcommand=results_scroll.set)
         self.trade_builder_results_tree.pack(side="left", fill="both", expand=True)
         results_scroll.pack(side="right", fill="y")
         self.trade_builder_results_tree.bind("<Double-1>", lambda _event: self._open_trade_builder_match())
-        self.trade_builder_summary = tk.StringVar(value="Select players to find near-value returns from other teams.")
+        self.trade_builder_summary = tk.StringVar(value="Select players to see near-value returns from other teams.")
         builder_actions = ttk.Frame(builder_tab)
         builder_actions.pack(fill="x", pady=(6, 0))
         ttk.Label(builder_actions, textvariable=self.trade_builder_summary, wraplength=1100).pack(side="left", fill="x", expand=True)
@@ -2136,6 +2143,29 @@ class App(tk.Tk):
         for index, item in enumerate(ordered):
             tree.move(item, "", index)
 
+    def _add_tree_expand_controls(self, parent, tree):
+        #Add consistent controls for opening or closing every expandable row in a tree.
+        controls = ttk.Frame(parent)
+        controls.pack(side="right")
+        ttk.Button(
+            controls, text="Expand All",
+            command=lambda: self._set_tree_expanded(tree, True),
+        ).pack(side="left", padx=(4, 0))
+        ttk.Button(
+            controls, text="Collapse All",
+            command=lambda: self._set_tree_expanded(tree, False),
+        ).pack(side="left", padx=(4, 0))
+
+    @staticmethod
+    def _set_tree_expanded(tree, expanded):
+        #Apply the requested state recursively so nested counteroffers are included.
+        def set_children(parent):
+            for item in tree.get_children(parent):
+                tree.item(item, open=expanded)
+                set_children(item)
+
+        set_children("")
+
     def _sort_trade_builder_tree(self, tree, column):
         #Sort builder rows by the selected field, toggling direction on repeated clicks.
         tree_key = "give" if tree is self.trade_builder_give_tree else "results"
@@ -2512,8 +2542,12 @@ class App(tk.Tk):
             self.trade_right_team.get() + "\n" + right_lineup
         )
 
-    def _clear_trade_builder_matches(self, message="Select players to find near-value returns from other teams."):
+    def _clear_trade_builder_matches(self, message="Select players to see near-value returns from other teams."):
         #Remove suggestions as soon as their offer inputs change.
+        pending_search = getattr(self, "_trade_builder_search_after", None)
+        if pending_search is not None:
+            self.after_cancel(pending_search)
+            self._trade_builder_search_after = None
         for item in self.trade_builder_results_tree.get_children():
             self.trade_builder_results_tree.delete(item)
         self.trade_builder_matches.clear()
@@ -2521,11 +2555,11 @@ class App(tk.Tk):
         self.trade_builder_summary.set(message)
 
     def _trade_builder_options_changed(self, _event=None):
-        #Require a fresh search after changing the selected team or value tolerance.
-        self._clear_trade_builder_matches("Trade settings changed. Find Matches to refresh suggestions.")
+        #Refresh suggestions when the user changes the team or value tolerance.
+        self._update_trade_builder_selection()
 
     def _trade_builder_team_changed(self, _event=None):
-        #Reload the offer roster and discard stale results when the builder team changes.
+        #Reload the offer roster and refresh suggestions for the selected team.
         self._clear_trade_builder_matches()
         self._refresh_trade_builder_roster()
 
@@ -2601,21 +2635,29 @@ class App(tk.Tk):
         self._update_trade_builder_selection()
 
     def _update_trade_builder_selection(self, _event=None):
-        #Summarize the offer and invalidate results tied to the previous selection.
+        #Summarize the offer and refresh suggestions for the latest selection.
         if hasattr(self, "trade_builder_results_tree"):
-            self._clear_trade_builder_matches("Offer changed. Find Matches to refresh suggestions.")
+            self._clear_trade_builder_matches("Updating near-value returns…")
         selected = self.trade_builder_give_tree.selection()
         if not selected:
             self.trade_builder_selection_var.set("Select one or more players to send.")
+            self.trade_builder_summary.set("Select players to see near-value returns from other teams.")
             return
         missing = [iid for iid in selected if str(iid) not in self.fantasycalc_values]
         if missing:
             self.trade_builder_selection_var.set(
                 f"{len(selected)} selected · value unavailable for {len(missing)} player(s)."
             )
+            self.trade_builder_summary.set("Waiting for FantasyCalc values before showing return packages.")
             return
         total = sum(self.fantasycalc_values[str(iid)] for iid in selected)
         self.trade_builder_selection_var.set(f"{len(selected)} selected · total FC value {total:,.0f}.")
+        #Debounce multi-select input so one search runs after the user finishes selecting players.
+        self._trade_builder_search_after = self.after(250, self._run_scheduled_trade_builder_search)
+
+    def _run_scheduled_trade_builder_search(self):
+        self._trade_builder_search_after = None
+        self._build_trade_suggestions()
 
     def _build_trade_suggestions(self):
         #Search one-to-three-player returns across opponent rosters by market-value distance.
