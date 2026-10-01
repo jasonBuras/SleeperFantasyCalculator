@@ -50,3 +50,18 @@ Building the executable is intended for the person preparing a release; league m
    ```
 
 The build script creates an isolated `.build-venv`, installs the packages listed in `requirements.txt` and PyInstaller, then writes `build\dist\FantasyTradeCalculator.exe`. It does not change your system Python packages. The generated build files are excluded from Git.
+
+## Code signing policy
+
+Free code signing provided by SignPath.io, certificate by SignPath Foundation.
+
+### Code signing team
+
+- Committers and reviewers: Jason Buras
+- Approver: Jason Buras
+
+### Privacy
+
+This program will not transfer any information to other networked systems
+unless specifically requested by the user or the person installing or
+operating it.
