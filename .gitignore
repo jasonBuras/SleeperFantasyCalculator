@@ -1,0 +1,34 @@
+#python bytecode and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+.build-venv/
+
+#build and packaging output (including the bundled installer and executable)
+/build/
+/dist/
+/wheels/
+*.egg-info/
+*.manifest
+*.toc
+
+#exported workbooks created while using the app
+*.xlsx
+
+#local secrets and settings
+.env
+.env.*
+!.env.example
+
+#operating system and editor files
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

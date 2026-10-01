@@ -1,0 +1,55 @@
+name: Build Windows Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify release tag matches app version
+        shell: pwsh
+        run: |
+          $source = Get-Content -LiteralPath sleeper_exporter.py -Raw
+          if ($source -notmatch 'APP_VERSION\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"') {
+            throw "Could not read APP_VERSION from sleeper_exporter.py."
+          }
+          $appVersion = $Matches[1]
+          if ($env:GITHUB_REF_NAME -ne "v$appVersion") {
+            throw "Release tag $env:GITHUB_REF_NAME must match app version v$appVersion."
+          }
+
+      - name: Build Windows app
+        shell: pwsh
+        run: .\build_windows.ps1
+
+      - name: Package update archive
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path .\build\dist\FantasyTradeCalculator.exe `
+            -DestinationPath .\build\dist\FantasyTradeCalculator-Windows.zip `
+            -CompressionLevel Optimal
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME `
+            .\build\dist\FantasyTradeCalculator-Windows.zip `
+            --title $env:GITHUB_REF_NAME `
+            --generate-notes

@@ -1,10 +1,18 @@
 #This file contains the desktop app, its Sleeper and FantasyCalc API helpers, and the Excel export logic.
 import json
+import itertools
+import hashlib
 import os
 import csv
+import re
+import shutil
 import statistics
+import subprocess
+import sys
+import tempfile
 import threading
 import uuid
+import zipfile
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -17,9 +25,17 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
-
 #This URL is the root used by Sleeper's read-only API.
 BASE_URL = "https://api.sleeper.app/v1"
+APP_VERSION = "1.1.0"
+GITHUB_RELEASE_API = "https://api.github.com/repos/jasonBuras/SleeperFantasyCalculator/releases/latest"
+UPDATE_ASSET_NAME = "FantasyTradeCalculator-Windows.zip"
+
+def resource_path(filename):
+    """Return an asset path for source runs and PyInstaller one-file builds."""
+    bundle_dir = getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)
+    return Path(bundle_dir) / filename
+
 #This folder keeps app settings and cached data in the current Windows user's home directory.
 CACHE_DIR = Path.home() / ".sleeper_fantasy_exporter"
 #Sleeper's large player directory is cached so it is not downloaded every time the app opens.
@@ -602,13 +618,21 @@ class App(tk.Tk):
         super().__init__()
 
         self.title("Fantasy Trade Calculator")
+        try:
+            self.iconbitmap(default=str(resource_path("app_icon.ico")))
+        except tk.TclError:
+            #Keep startup working if the optional window icon cannot be loaded.
+            pass
 
         self.api = SleeperAPI()
         self.user = None
         self.leagues = []
         self.dataframes = None
+        self.loaded_username = ""
         self.fantasycalc_values = {}
         self.fantasycalc_trends = {}
+        self.fantasycalc_overall_ranks = {}
+        self.fantasycalc_position_ranks = {}
         self.stats_guy_players = {}
         self.stats_guy_values_asof = {}
         self.stats_guy_error = ""
@@ -620,6 +644,16 @@ class App(tk.Tk):
         self.trade_history_series = []
         self.trade_history_signature = None
         self.trade_history_request_id = 0
+        self.trade_history_metric_var = tk.StringVar(value="Percent Change")
+        self.trade_history_plot_points = {}
+        self.trade_history_window = None
+        self.trade_history_popup_canvas = None
+        self.player_history_window = None
+        self.player_history_popup_canvas = None
+        self.player_history_popup_source = None
+        self.player_history_popup_points_name = None
+        self.player_history_popup_empty_text = None
+        self.player_history_popup_scale = None
         self.team_names = []
         self.team_options = []
         self._trade_populating = False
@@ -640,11 +674,13 @@ class App(tk.Tk):
         self.roster_projection_error = ""
         self.roster_history_player_id = None
         self.roster_history_points = []
+        self.roster_search_items = []
         self.weekly_history_player_id = None
         self.weekly_history_points = []
         #Keep trades and user preferences between app sessions.
         self.saved_trades = self._load_saved_trades()
         self.active_saved_trade_id = None
+        self.active_counteroffer_parent_id = None
         self.saved_settings = self._load_settings()
         self.startup_autoload_pending = bool(
             self.saved_settings.get("username") and self.saved_settings.get("league_id")
@@ -655,7 +691,14 @@ class App(tk.Tk):
             value=self.saved_settings.get("season", str(datetime.now().year))
         )
         self.league_var = tk.StringVar()
+        self.window_context_var = tk.StringVar(value="Select a league in Main Menu")
         self.status_var = tk.StringVar(value="Enter a Sleeper username and load leagues.")
+        self.update_status_var = tk.StringVar(value=f"Installed version {APP_VERSION}. Check for updates when you're ready.")
+        self.update_notes_var = tk.StringVar(value="Release notes will appear here after checking for updates.")
+        self.available_update = None
+        self.copy_trade_preview_var = tk.StringVar(
+            value="Select at least one player from each team to preview the copied text."
+        )
         self.dark_mode_var = tk.BooleanVar(value=bool(self.saved_settings.get("dark_mode", False)))
         self.attribution_labels = []
         self.style = ttk.Style(self)
@@ -667,6 +710,7 @@ class App(tk.Tk):
 
         #Apply the user's saved appearance, then build the visible app and settings hooks.
         self._build_ui()
+        self._compact_tree_columns()
         self._size_window_to_screen()
         self.username_var.trace_add("write", self._save_settings)
         self.season_var.trace_add("write", self._save_settings)
@@ -697,6 +741,27 @@ class App(tk.Tk):
         except OSError:
             # Keep the UI usable if the settings folder is unavailable.
             pass
+
+    def _update_window_context(self):
+        #Keep the active username and league visible while users move between tabs.
+        username = self.loaded_username or self.username_var.get().strip()
+        league_name = ""
+        if self.dataframes is not None:
+            try:
+                league_name = str(self.dataframes["League Info"].iloc[0]["League Name"])
+            except (KeyError, IndexError, AttributeError):
+                league_name = ""
+        else:
+            league = self.selected_league() if hasattr(self, "league_combo") else None
+            if league and str(league.get("season", self.season_var.get())) == self.season_var.get().strip():
+                league_name = str(league.get("name") or "Unnamed League")
+        if username and league_name:
+            text = f"{username}  |  {league_name}"
+        elif username:
+            text = f"{username}  |  Choose a league in Main Menu"
+        else:
+            text = "Choose a Sleeper league in Main Menu"
+        self.window_context_var.set(text)
 
     def _apply_theme(self):
         #Set colors for all ttk controls so the toggle changes the full app consistently.
@@ -748,7 +813,7 @@ class App(tk.Tk):
         self.style.map("TNotebook.Tab", background=[("selected", accent), ("active", colors["hover"])],
                        foreground=[("selected", "#ffffff"), ("active", fg)])
         self.style.configure("Treeview", background=field, fieldbackground=field, foreground=fg,
-                             bordercolor=colors["border"], rowheight=24)
+                             bordercolor=colors["border"], rowheight=22)
         self.style.map("Treeview", background=[("selected", colors["selected"])],
                        foreground=[("selected", fg)])
         self.style.configure("Treeview.Heading", background=surface, foreground=fg,
@@ -775,33 +840,244 @@ class App(tk.Tk):
                 canvas.configure(bg=surface, highlightbackground=colors["border"])
                 self._draw_history_chart(canvas, getattr(self, points_name, []), empty_text)
         if hasattr(self, "trade_history_canvas"):
-            self.trade_history_canvas.configure(bg=surface, highlightbackground=colors["border"])
             self._draw_trade_history()
+        if hasattr(self, "trade_tab_canvas"):
+            self.trade_tab_canvas.configure(bg=bg)
 
     def _toggle_dark_mode(self):
         #Apply the chosen palette and save it for the next launch.
         self._apply_theme()
         self._save_settings()
 
+    @staticmethod
+    def _app_version_key(version):
+        #Compare the numeric parts of a version tag while accepting an optional leading v.
+        match = re.fullmatch(r"v?(\d+)\.(\d+)(?:\.(\d+))?", str(version).strip())
+        if not match:
+            raise ValueError(f"Unsupported version number: {version}")
+        return tuple(int(part or 0) for part in match.groups())
+
+    @staticmethod
+    def _plain_release_notes(body):
+        #Trim common Markdown formatting so release notes read cleanly in the compact menu.
+        text = str(body or "").strip()
+        text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+        text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.MULTILINE)
+        text = re.sub(r"[*`_]", "", text)
+        return text[:2400] or "No release notes were provided."
+
+    def _fetch_latest_app_release(self):
+        #Read the latest stable GitHub Release and find its Windows update package.
+        response = requests.get(
+            GITHUB_RELEASE_API,
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "FantasyTradeCalculator"},
+            timeout=(8, 20),
+        )
+        if response.status_code == 404:
+            return {"not_published": True}
+        response.raise_for_status()
+        release = response.json()
+        version = str(release.get("tag_name", "")).strip()
+        version_key = self._app_version_key(version)
+        asset = next((item for item in release.get("assets", [])
+                      if item.get("name") == UPDATE_ASSET_NAME), None)
+        return {
+            "version": version,
+            "version_key": version_key,
+            "url": str(asset.get("browser_download_url", "")) if asset else "",
+            "digest": str(asset.get("digest", "")) if asset else "",
+            "size": int(asset.get("size", 0)) if asset else 0,
+            "notes": self._plain_release_notes(release.get("body", "")),
+            "release_url": str(release.get("html_url", "")),
+        }
+
+    def _check_for_app_updates(self):
+        #Check GitHub in the background so a slow connection never freezes the app.
+        self.update_check_button.configure(state="disabled")
+        self.update_install_button.configure(state="disabled")
+        self.available_update = None
+        self.update_status_var.set("Checking GitHub for the latest release…")
+        self.update_notes_var.set("")
+        self.run_background(self._fetch_latest_app_release_safely, self._show_app_update_result)
+
+    def _fetch_latest_app_release_safely(self):
+        #Return network errors to the update panel without leaving its controls disabled.
+        try:
+            return self._fetch_latest_app_release()
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    def _show_app_update_result(self, result):
+        #Explain the release status and enable installation only for a verified Windows package.
+        self.update_check_button.configure(state="normal")
+        if result.get("error"):
+            self.update_status_var.set("Could not check for updates.")
+            self.update_notes_var.set(result["error"])
+            return
+        if result.get("not_published"):
+            self.update_status_var.set(f"Installed version {APP_VERSION} · No release has been published yet.")
+            self.update_notes_var.set("When a new version is released, its changes will appear here.")
+            return
+        self.update_notes_var.set(result["notes"])
+        try:
+            current_version = self._app_version_key(APP_VERSION)
+        except ValueError as exc:
+            self.update_status_var.set(str(exc))
+            return
+        if result["version_key"] <= current_version:
+            self.update_status_var.set(f"You're up to date · version {APP_VERSION}.")
+            return
+        self.available_update = result
+        if not result["url"] or not result["digest"].startswith("sha256:"):
+            self.update_status_var.set(f"Version {result['version']} is available, but its verified Windows package is missing.")
+            return
+        if not getattr(sys, "frozen", False) or os.name != "nt":
+            self.update_status_var.set(
+                f"Version {result['version']} is available. Install updates from the packaged Windows app."
+            )
+            return
+        self.update_status_var.set(f"Version {result['version']} is ready to install.")
+        self.update_install_button.configure(state="normal")
+
+    def _download_app_update(self):
+        #Download and verify the release package before asking to close the app.
+        release = self.available_update
+        if not release:
+            return
+        self.update_install_button.configure(state="disabled")
+        self.update_check_button.configure(state="disabled")
+        self.update_status_var.set(f"Downloading version {release['version']}…")
+        self.run_background(lambda: self._download_verified_update(release), self._app_update_downloaded)
+
+    @staticmethod
+    def _download_verified_update(release):
+        #Accept only the project's HTTPS release asset and verify its published SHA-256 digest.
+        url = release["url"]
+        prefix = "https://github.com/jasonBuras/SleeperFantasyCalculator/releases/download/"
+        if not url.startswith(prefix):
+            return {"error": "The release package link is not from the project's GitHub Releases page."}
+        if release["size"] <= 0 or release["size"] > 300 * 1024 * 1024:
+            return {"error": "The release package has an unexpected file size."}
+        update_dir = Path(tempfile.mkdtemp(prefix="fantasy-trade-update-"))
+        archive_path = update_dir / UPDATE_ASSET_NAME
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            with requests.get(url, stream=True, timeout=(10, 60), headers={"User-Agent": "FantasyTradeCalculator"}) as response:
+                response.raise_for_status()
+                with archive_path.open("wb") as archive_file:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > 300 * 1024 * 1024:
+                            raise ValueError("The downloaded update is larger than expected.")
+                        digest.update(chunk)
+                        archive_file.write(chunk)
+            if total != release["size"]:
+                raise ValueError("The downloaded update size does not match the release details.")
+            expected_digest = release["digest"].split(":", 1)[1].casefold()
+            if not re.fullmatch(r"[0-9a-f]{64}", expected_digest) or digest.hexdigest() != expected_digest:
+                raise ValueError("The update failed its SHA-256 integrity check. Nothing was installed.")
+            with zipfile.ZipFile(archive_path) as package:
+                files = [item for item in package.infolist() if not item.is_dir()]
+                if len(files) != 1 or files[0].filename != "FantasyTradeCalculator.exe":
+                    raise ValueError("The update package does not contain the expected app file.")
+                if files[0].file_size < 1_000_000 or package.testzip() is not None:
+                    raise ValueError("The downloaded update package is incomplete or damaged.")
+            return {"archive": str(archive_path), "helper_dir": str(update_dir)}
+        except Exception as exc:
+            try:
+                archive_path.unlink(missing_ok=True)
+                update_dir.rmdir()
+            except OSError:
+                pass
+            return {"error": str(exc)}
+
+    def _app_update_downloaded(self, result):
+        #Ask before closing, then hand the verified archive to the post-exit updater.
+        if result.get("error"):
+            self.update_check_button.configure(state="normal")
+            self.update_install_button.configure(state="normal" if self.available_update else "disabled")
+            self.update_status_var.set("The update could not be downloaded.")
+            messagebox.showerror("Update Download Failed", result["error"])
+            return
+        release = self.available_update
+        if not messagebox.askyesno(
+            "Install Update",
+            f"Version {release['version']} is downloaded and verified.\n\n"
+            "The app will close, replace its program file, and reopen. Your saved leagues and trades are kept separately. "
+            "The app folder must allow file changes. Continue?",
+        ):
+            shutil.rmtree(result["helper_dir"], ignore_errors=True)
+            self.update_check_button.configure(state="normal")
+            self.update_install_button.configure(state="normal")
+            self.update_status_var.set(f"Version {release['version']} is ready when you are.")
+            return
+        executable = Path(sys.executable).resolve()
+        if executable.name.casefold() != "fantasytradecalculator.exe":
+            shutil.rmtree(result["helper_dir"], ignore_errors=True)
+            self.update_check_button.configure(state="normal")
+            self.update_install_button.configure(state="normal")
+            messagebox.showerror("Cannot Install Update", "This app file has been renamed. Restore the name FantasyTradeCalculator.exe and try again.")
+            return
+        try:
+            config_path = Path(result["helper_dir"]) / "update.json"
+            script_path = Path(result["helper_dir"]) / "install_update.ps1"
+            script_path.write_text(resource_path("install_update.ps1").read_text(encoding="utf-8"), encoding="utf-8")
+            config_path.write_text(json.dumps({
+                "process_id": os.getpid(),
+                "executable": str(executable),
+                "archive": result["archive"],
+                "helper_script": str(script_path),
+            }), encoding="utf-8")
+            subprocess.Popen(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+                 "-File", str(script_path), "-ConfigPath", str(config_path)],
+                cwd=str(result["helper_dir"]), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception as exc:
+            shutil.rmtree(result["helper_dir"], ignore_errors=True)
+            self.update_check_button.configure(state="normal")
+            self.update_install_button.configure(state="normal")
+            messagebox.showerror("Cannot Start Update", str(exc))
+            return
+        self.update_status_var.set("Closing the app to install the update…")
+        self.destroy()
+
     def _build_ui(self):
         #Create the app header, league controls, work tabs, and bottom status indicator.
-        main = ttk.Frame(self, padding=20)
+        main = ttk.Frame(self, padding=10)
         main.pack(fill="both", expand=True)
 
         header = ttk.Frame(main)
-        header.pack(fill="x", pady=(0, 15))
+        header.pack(fill="x", pady=(0, 8))
         ttk.Label(
             header,
             text="Fantasy Trade Calculator",
             font=("TkDefaultFont", 18, "bold")
         ).pack(side="left", anchor="w")
+        ttk.Label(
+            header, textvariable=self.window_context_var,
+            font=("TkDefaultFont", 10),
+        ).pack(side="left", anchor="w", padx=(14, 0), fill="x", expand=True)
         ttk.Checkbutton(
             header, text="Dark mode", variable=self.dark_mode_var,
             command=self._toggle_dark_mode
         ).pack(side="right", padx=5)
 
-        #These controls let the user choose a Sleeper account, season, and league.
-        form = ttk.LabelFrame(main, text="League Selection", padding=15)
+        #The Main Menu contains league selection and actions; the active context stays in the header.
+        self.workspace = ttk.Notebook(main)
+        self.workspace.pack(fill="both", expand=True)
+        main_menu_tab = ttk.Frame(self.workspace, padding=12)
+        self.workspace.add(main_menu_tab, text="Main Menu")
+        ttk.Label(
+            main_menu_tab,
+            text="Choose the Sleeper account, season, and league to open. Your active league is shown at the top of every page.",
+            wraplength=1050,
+        ).pack(anchor="w", pady=(0, 10))
+
+        form = ttk.LabelFrame(main_menu_tab, text="League Selection", padding=9)
         form.pack(fill="x")
 
         ttk.Label(form, text="Sleeper Username:").grid(row=0, column=0, sticky="w", pady=6)
@@ -837,8 +1113,8 @@ class App(tk.Tk):
         form.columnconfigure(1, weight=1)
 
         #Keep loading and export actions together above the analysis tabs.
-        actions = ttk.Frame(main)
-        actions.pack(fill="x", pady=15)
+        actions = ttk.Frame(main_menu_tab)
+        actions.pack(fill="x", pady=(12, 0))
 
         ttk.Button(
             actions,
@@ -860,12 +1136,27 @@ class App(tk.Tk):
         )
         self.export_button.pack(side="right")
 
-        #The notebook separates roster needs, trade review, saved ideas, and targets.
-        self.workspace = ttk.Notebook(main)
-        self.workspace.pack(fill="both", expand=True)
+        updates = ttk.LabelFrame(main_menu_tab, text="Software Updates", padding=9)
+        updates.pack(fill="x", pady=(12, 0))
+        update_actions = ttk.Frame(updates)
+        update_actions.pack(fill="x")
+        self.update_check_button = ttk.Button(
+            update_actions, text="Check for Updates", command=self._check_for_app_updates,
+        )
+        self.update_check_button.pack(side="left")
+        self.update_install_button = ttk.Button(
+            update_actions, text="Download and Install", command=self._download_app_update,
+            state="disabled",
+        )
+        self.update_install_button.pack(side="left", padx=(8, 10))
+        ttk.Label(update_actions, textvariable=self.update_status_var).pack(side="left", fill="x", expand=True)
+        ttk.Label(
+            updates, textvariable=self.update_notes_var, wraplength=1050, justify="left",
+        ).pack(anchor="w", fill="x", pady=(7, 0))
 
         #Position Needs compares one team's roster counts with the league lineup slots.
         needs_tab = ttk.Frame(self.workspace, padding=12)
+        self.position_needs_tab = needs_tab
         self.workspace.add(needs_tab, text="Position Needs")
         ttk.Label(needs_tab, text="Review roster depth against your league's starting lineup.").pack(anchor="w", pady=(0, 8))
         needs_controls = ttk.Frame(needs_tab)
@@ -874,7 +1165,7 @@ class App(tk.Tk):
         self.needs_team_combo = ttk.Combobox(needs_controls, state="readonly", width=36)
         self.needs_team_combo.pack(side="left", padx=8)
         self.needs_team_combo.bind("<<ComboboxSelected>>", self._show_position_needs)
-        self.needs_tree = ttk.Treeview(needs_tab, columns=("required", "starting", "rostered", "bench", "assessment"), show="tree headings", height=16)
+        self.needs_tree = ttk.Treeview(needs_tab, columns=("required", "starting", "rostered", "bench", "assessment"), show="tree headings", height=8)
         self.needs_tree.heading("#0", text="Position")
         for key, label in (("required", "Starter Spots"), ("starting", "Starting"), ("rostered", "Rostered"), ("bench", "Bench Depth"), ("assessment", "Overview")):
             self.needs_tree.heading(key, text=label)
@@ -899,11 +1190,21 @@ class App(tk.Tk):
         self.roster_team_combo.bind("<<ComboboxSelected>>", self._refresh_roster_view)
         self.roster_projection_note = tk.StringVar(value="Weekly projections appear when Sleeper publishes them.")
         ttk.Label(roster_controls, textvariable=self.roster_projection_note).pack(side="left", padx=(8, 0))
+        roster_search_row = ttk.Frame(roster_tab)
+        roster_search_row.pack(fill="x", pady=(0, 5))
+        ttk.Label(roster_search_row, text="Search Player:").pack(side="left")
+        self.roster_search_var = tk.StringVar()
+        ttk.Entry(roster_search_row, textvariable=self.roster_search_var, width=32).pack(
+            side="left", padx=(8, 0)
+        )
+        self.roster_search_status = tk.StringVar(value="Search by player, position, team, or status.")
+        ttk.Label(roster_search_row, textvariable=self.roster_search_status).pack(side="left", padx=10)
+        self.roster_search_var.trace_add("write", lambda *_: self._apply_roster_search())
         roster_list = ttk.Frame(roster_tab)
         roster_list.pack(fill="both", expand=True)
         self.roster_tree = ttk.Treeview(
             roster_list, columns=("slot", "position", "nfl_team", "status", "bye", "projection"),
-            show="tree headings", selectmode="browse", height=12,
+            show="tree headings", selectmode="browse", height=8,
         )
         self.roster_tree.heading("#0", text="Name")
         for key, label in (("slot", "Slot"), ("position", "Position"), ("nfl_team", "NFL Team"),
@@ -931,11 +1232,11 @@ class App(tk.Tk):
         roster_history_credit.bind("<Button-1>", lambda _event: __import__("webbrowser").open("https://statsguyfantasy.com/"))
         roster_history_panel = ttk.LabelFrame(roster_tab, text="Player Value History", padding=7)
         roster_history_panel.pack(fill="x", pady=(6, 0))
-        self._build_history_window_control(roster_history_panel)
+        self._build_history_window_control(roster_history_panel, action=lambda: self._open_player_history_graph("roster"))
         ttk.Label(roster_history_panel, textvariable=self.roster_history_detail, wraplength=1050,
                   justify="left").pack(anchor="w")
         self.roster_history_canvas = tk.Canvas(
-            roster_history_panel, height=112, highlightthickness=0,
+            roster_history_panel, height=72, highlightthickness=0,
             bg=self.theme_colors["surface"], highlightbackground=self.theme_colors["border"],
         )
         self.roster_history_canvas.pack(fill="x", pady=(4, 0))
@@ -1018,11 +1319,11 @@ class App(tk.Tk):
         weekly_history_credit.bind("<Button-1>", lambda _event: __import__("webbrowser").open("https://statsguyfantasy.com/"))
         weekly_history_panel = ttk.LabelFrame(weekly_tab, text="Selected Player Value History", padding=7)
         weekly_history_panel.pack(fill="x", pady=(5, 0))
-        self._build_history_window_control(weekly_history_panel)
+        self._build_history_window_control(weekly_history_panel, action=lambda: self._open_player_history_graph("weekly"))
         ttk.Label(weekly_history_panel, textvariable=self.weekly_history_detail, wraplength=1050,
                   justify="left").pack(anchor="w")
         self.weekly_history_canvas = tk.Canvas(
-            weekly_history_panel, height=100, highlightthickness=0,
+            weekly_history_panel, height=68, highlightthickness=0,
             bg=self.theme_colors["surface"], highlightbackground=self.theme_colors["border"],
         )
         self.weekly_history_canvas.pack(fill="x", pady=(4, 0))
@@ -1067,7 +1368,7 @@ class App(tk.Tk):
         trend_list.pack(fill="both", expand=True)
         self.value_trend_tree = ttk.Treeview(
             trend_list, columns=("position", "rostered_by", "fc", "fc30", "stats_guy", "spread"),
-            show="tree headings", selectmode="browse", height=12,
+            show="tree headings", selectmode="browse", height=8,
         )
         self.value_trend_tree.heading("#0", text="Player", command=lambda: self._sort_value_trends("name"))
         self.value_trend_tree.heading("position", text="Position", command=lambda: self._sort_value_trends("position"))
@@ -1089,21 +1390,45 @@ class App(tk.Tk):
         self.value_trend_detail = tk.StringVar(value="Select a player to see volatility and the recent value history.")
         history_panel = ttk.LabelFrame(trends_tab, text="Selected Player: History and Volatility", padding=8)
         history_panel.pack(fill="x", pady=(7, 0))
-        self._build_history_window_control(history_panel)
+        self._build_history_window_control(history_panel, action=lambda: self._open_player_history_graph("trends"))
         ttk.Label(history_panel, textvariable=self.value_trend_detail, wraplength=1050,
                   justify="left").pack(anchor="w")
         self.value_history_canvas = tk.Canvas(
-            history_panel, height=150, highlightthickness=0,
+            history_panel, height=82, highlightthickness=0,
             bg=self.theme_colors["surface"], highlightbackground=self.theme_colors["border"],
         )
         self.value_history_canvas.pack(fill="x", pady=(5, 0))
         self.value_history_canvas.bind("<Configure>", lambda _event: self._draw_value_history())
         self.value_history_points = []
 
-        #Trade Review compares selected players and shows each team's roster-count changes.
-        self.trade_tab = ttk.Frame(self.workspace, padding=12)
-        trade_tab = self.trade_tab
-        self.workspace.add(trade_tab, text="Trade Review")
+        #Trade Review scrolls as one page when the window cannot show every section at once.
+        self.trade_tab = ttk.Frame(self.workspace)
+        self.workspace.add(self.trade_tab, text="Trade Review")
+        self.trade_tab_canvas = tk.Canvas(
+            self.trade_tab, highlightthickness=0, borderwidth=0,
+            bg=self.theme_colors["background"],
+        )
+        trade_tab_scroll = ttk.Scrollbar(
+            self.trade_tab, orient="vertical", command=self.trade_tab_canvas.yview
+        )
+        self.trade_tab_canvas.configure(yscrollcommand=trade_tab_scroll.set)
+        self.trade_tab_canvas.pack(side="left", fill="both", expand=True)
+        trade_tab_scroll.pack(side="right", fill="y")
+        trade_tab = ttk.Frame(self.trade_tab_canvas, padding=8)
+        trade_tab_window = self.trade_tab_canvas.create_window(
+            (0, 0), window=trade_tab, anchor="nw"
+        )
+        trade_tab.bind(
+            "<Configure>",
+            lambda _event: self.trade_tab_canvas.configure(
+                scrollregion=self.trade_tab_canvas.bbox("all")
+            ),
+        )
+        self.trade_tab_canvas.bind(
+            "<Configure>",
+            lambda event: self.trade_tab_canvas.itemconfigure(trade_tab_window, width=event.width),
+        )
+        self.bind_all("<MouseWheel>", self._scroll_trade_tab, add="+")
         ttk.Label(trade_tab, text="Select the players on each side to compare market values.", font=("TkDefaultFont", 11, "bold")).pack(anchor="w")
         #ttk.Label(trade_tab, text="Click a column title to sort. Names sort by last name; positions follow QB, RB, WR, TE, K.", wraplength=850).pack(anchor="w", pady=(2, 3))
         #ttk.Label(trade_tab, text="Market estimate from FantasyCalc. Roster fit and projections are not included.", wraplength=850).pack(anchor="w", pady=(3, 5))
@@ -1138,38 +1463,71 @@ class App(tk.Tk):
         right = ttk.LabelFrame(sides, text="You receive", padding=8)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-        self.trade_left_team = ttk.Combobox(left, state="readonly")
-        self.trade_right_team = ttk.Combobox(right, state="readonly")
-        self.trade_left_team.pack(fill="x", pady=(0, 7))
-        self.trade_right_team.pack(fill="x", pady=(0, 7))
+        left_team_row = ttk.Frame(left)
+        right_team_row = ttk.Frame(right)
+        left_team_row.pack(fill="x", pady=(0, 7))
+        right_team_row.pack(fill="x", pady=(0, 7))
+        self.trade_left_team = ttk.Combobox(left_team_row, state="readonly")
+        self.trade_right_team = ttk.Combobox(right_team_row, state="readonly")
+        self.trade_left_team.pack(side="left", fill="x", expand=True)
+        self.trade_right_team.pack(side="left", fill="x", expand=True)
         self.trade_left_team.bind("<<ComboboxSelected>>", self._populate_trade_rosters)
         self.trade_right_team.bind("<<ComboboxSelected>>", self._populate_trade_rosters)
-        ttk.Button(left, text="Clear Selection", command=lambda: self._clear_trade_selection(self.trade_left_tree)).pack(anchor="e", pady=(0, 5))
-        ttk.Button(right, text="Clear Selection", command=lambda: self._clear_trade_selection(self.trade_right_tree)).pack(anchor="e", pady=(0, 5))
-        self.trade_left_tree = self._make_trade_tree(left)
-        self.trade_right_tree = self._make_trade_tree(right)
-        self.trade_left_tree.pack(fill="both", expand=True)
-        self.trade_right_tree.pack(fill="both", expand=True)
+        ttk.Button(left_team_row, text="Clear Selection", command=lambda: self._clear_trade_selection(self.trade_left_tree)).pack(side="left", padx=(8, 0))
+        ttk.Button(right_team_row, text="Clear Selection", command=lambda: self._clear_trade_selection(self.trade_right_tree)).pack(side="left", padx=(8, 0))
+        left_roster_list = ttk.Frame(left)
+        right_roster_list = ttk.Frame(right)
+        left_roster_list.pack(fill="both", expand=True)
+        right_roster_list.pack(fill="both", expand=True)
+        self.trade_left_tree = self._make_trade_tree(left_roster_list)
+        self.trade_right_tree = self._make_trade_tree(right_roster_list)
+        left_scroll = ttk.Scrollbar(left_roster_list, orient="vertical", command=self.trade_left_tree.yview)
+        right_scroll = ttk.Scrollbar(right_roster_list, orient="vertical", command=self.trade_right_tree.yview)
+        self.trade_left_tree.configure(yscrollcommand=left_scroll.set)
+        self.trade_right_tree.configure(yscrollcommand=right_scroll.set)
+        self.trade_left_tree.pack(side="left", fill="both", expand=True)
+        left_scroll.pack(side="right", fill="y")
+        self.trade_right_tree.pack(side="left", fill="both", expand=True)
+        right_scroll.pack(side="right", fill="y")
         ttk.Label(left, text="Hold Ctrl to select multiple players.").pack(anchor="w", pady=(5, 0))
         ttk.Label(right, text="Hold Ctrl to select multiple players.").pack(anchor="w", pady=(5, 0))
         self.trade_left_tree.bind("<<TreeviewSelect>>", self._update_trade_review)
         self.trade_right_tree.bind("<<TreeviewSelect>>", self._update_trade_review)
+        copy_preview = ttk.LabelFrame(trade_tab, text="Trade Overview", padding=5)
+        copy_preview.pack(fill="x", pady=(5, 0))
+        ttk.Label(copy_preview, textvariable=self.copy_trade_preview_var,
+                  wraplength=1300, justify="left").pack(anchor="w")
         trade_actions = ttk.Frame(trade_tab)
-        trade_actions.pack(fill="x", pady=(9, 0))
+        trade_actions.pack(fill="x", pady=(5, 0))
         self.save_trade_button = ttk.Button(trade_actions, text="Save Trade", command=self._save_current_trade)
         self.save_trade_button.pack(side="left")
-        ttk.Button(trade_actions, text="New Trade", command=self._new_trade).pack(side="left", padx=8)
+        self.save_as_new_trade_button = ttk.Button(
+            trade_actions, text="Save as New Trade",
+            command=lambda: self._save_current_trade(save_as_new=True),
+        )
+        self.new_trade_button = ttk.Button(trade_actions, text="New Trade", command=self._new_trade)
+        self.new_trade_button.pack(side="left", padx=8)
         self.copy_trade_button = ttk.Button(
-            trade_actions, text="Copy Trade Text", command=self._copy_trade_text, state="disabled"
+            trade_actions, text="Copy Trade Overview Text", command=self._copy_trade_text, state="disabled"
         )
         self.copy_trade_button.pack(side="left")
         note_row = ttk.Frame(trade_tab)
-        note_row.pack(fill="x", pady=(7, 0))
+        note_row.pack(fill="x", pady=(4, 0))
         ttk.Label(note_row, text="Note:").pack(side="left")
         self.trade_note_var = tk.StringVar()
         ttk.Entry(note_row, textvariable=self.trade_note_var).pack(side="left", fill="x", expand=True, padx=(8, 0))
         self.trade_result_var = tk.StringVar(value="Load a league to review a trade.")
         ttk.Label(trade_tab, textvariable=self.trade_result_var, font=("TkDefaultFont", 12, "bold"), wraplength=850).pack(anchor="w", pady=(6, 0))
+        balance_row = ttk.Frame(trade_tab)
+        balance_row.pack(fill="x", pady=(3, 0))
+        ttk.Label(balance_row, text="Trade balance:").pack(side="left")
+        self.trade_balance_canvas = tk.Canvas(
+            balance_row, width=260, height=18, highlightthickness=0,
+            bg=self.theme_colors["background"],
+        )
+        self.trade_balance_canvas.pack(side="left", padx=(8, 10))
+        self.trade_balance_summary = tk.StringVar(value="Select players on both sides.")
+        ttk.Label(balance_row, textvariable=self.trade_balance_summary).pack(side="left")
         self.trade_stats_guy_result_var = tk.StringVar(value="Stats Guy trade values will appear here after loading.")
         ttk.Label(trade_tab, textvariable=self.trade_stats_guy_result_var, font=("TkDefaultFont", 10, "bold"),
                   wraplength=850).pack(anchor="w", pady=(3, 0))
@@ -1179,19 +1537,25 @@ class App(tk.Tk):
         self.trade_impact_summary = tk.StringVar(value="Roster impact appears when you select players.")
         ttk.Label(impact_row, textvariable=self.trade_impact_summary, wraplength=760).pack(side="left", anchor="w", fill="x", expand=True)
         ttk.Button(impact_row, text="View Lineup Impact", command=self._show_lineup_impact).pack(side="right", padx=(8, 0))
-        trade_history_panel = ttk.LabelFrame(trade_tab, text="Selected Players' Value Trends", padding=7)
-        trade_history_panel.pack(fill="x", pady=(6, 0))
-        self._build_history_window_control(trade_history_panel)
-        ttk.Label(trade_history_panel, text="Indexed change from the first snapshot (%) · select players on either side to compare.",
+        trade_history_panel = ttk.LabelFrame(trade_tab, text="Selected Players' Value Trends", padding=4)
+        trade_history_panel.pack(fill="x", pady=(4, 0))
+        trade_history_toolbar = ttk.Frame(trade_history_panel)
+        trade_history_toolbar.pack(fill="x")
+        self._build_history_window_control(trade_history_toolbar, metric=True, action=self._open_trade_history_window)
+        ttk.Label(trade_history_panel, text="Choose Percent Change or Value; hover over a line to see the date, value, and change.",
                   wraplength=1000).pack(anchor="w")
         self.trade_history_status = tk.StringVar(value="Select one or more players to compare their value trends.")
         ttk.Label(trade_history_panel, textvariable=self.trade_history_status, wraplength=1000).pack(anchor="w")
         self.trade_history_canvas = tk.Canvas(
-            trade_history_panel, height=145, highlightthickness=0,
+            trade_history_panel, height=170 if self.winfo_screenheight() > 1200 else 96, highlightthickness=0,
             bg=self.theme_colors["surface"], highlightbackground=self.theme_colors["border"],
         )
         self.trade_history_canvas.pack(fill="x", pady=(3, 0))
         self.trade_history_canvas.bind("<Configure>", lambda _event: self._draw_trade_history())
+        self.trade_history_canvas.bind(
+            "<Motion>", lambda event: self._show_trade_history_hover(event, self.trade_history_canvas)
+        )
+        self.trade_history_canvas.bind("<Leave>", lambda _event: self._clear_trade_history_hover(self.trade_history_canvas))
 
         #Saved Trades keeps proposals available for reopening and editing later.
         self.saved_trade_tab = ttk.Frame(self.workspace, padding=12)
@@ -1204,7 +1568,7 @@ class App(tk.Tk):
         self.saved_trade_tree = ttk.Treeview(
             self.saved_trade_tab,
             columns=("outcome", "give", "receive", "lean", "note", "updated"),
-            show="tree headings", selectmode="browse", height=10,
+            show="tree headings", selectmode="browse", height=7,
         )
         self.saved_trade_tree.heading("#0", text="Trade")
         for key, label in (("outcome", "Outcome"), ("give", "You Give"), ("receive", "You Receive"),
@@ -1224,6 +1588,7 @@ class App(tk.Tk):
         saved_actions = ttk.Frame(self.saved_trade_tab)
         saved_actions.pack(fill="x")
         ttk.Button(saved_actions, text="Reopen Trade", command=self._reopen_saved_trade).pack(side="left")
+        ttk.Button(saved_actions, text="Add Counteroffer", command=lambda: self._reopen_saved_trade(as_counteroffer=True)).pack(side="left", padx=(8, 0))
         ttk.Button(saved_actions, text="Mark Accepted", command=lambda: self._mark_saved_trade_outcome("Accepted")).pack(side="left", padx=(8, 0))
         ttk.Button(saved_actions, text="Mark Rejected", command=lambda: self._mark_saved_trade_outcome("Rejected")).pack(side="left", padx=8)
         ttk.Button(saved_actions, text="Mark Pending", command=lambda: self._mark_saved_trade_outcome("Proposed")).pack(side="left")
@@ -1232,6 +1597,8 @@ class App(tk.Tk):
         )
         self.copy_outcome_button.pack(side="left", padx=8)
         ttk.Button(saved_actions, text="Delete Saved Trade", command=self._delete_saved_trade).pack(side="right")
+        ttk.Button(saved_actions, text="Import Trades", command=self._import_saved_trades).pack(side="right", padx=(0, 8))
+        ttk.Button(saved_actions, text="Export Trades", command=self._export_saved_trades).pack(side="right", padx=(0, 8))
 
         #Trade Targets lists bench-player one-for-one ideas based on reciprocal position needs.
         ideas_tab = ttk.Frame(self.workspace, padding=12)
@@ -1254,7 +1621,7 @@ class App(tk.Tk):
         self.trade_ideas_tree = ttk.Treeview(
             ideas_list,
             columns=("match", "offer", "offer_value", "target", "target_value", "fit"),
-            show="tree headings", selectmode="browse", height=18,
+            show="tree headings", selectmode="browse", height=8,
         )
         self.trade_ideas_tree.heading("#0", text="Trade Partner")
         for key, label in (("match", "Position Fit"), ("offer", "You Could Offer"),
@@ -1279,6 +1646,115 @@ class App(tk.Tk):
         ttk.Label(ideas_tab, textvariable=self.trade_ideas_summary, wraplength=900).pack(anchor="w", pady=(8, 0))
         self.trade_ideas_by_id = {}
 
+        #Trade Builder finds near-even player packages across every opposing roster.
+        builder_tab = ttk.Frame(self.workspace, padding=12)
+        self.workspace.add(builder_tab, text="Trade Builder")
+        ttk.Label(
+            builder_tab, text="Build a market-balanced offer from players on your roster.",
+            font=("TkDefaultFont", 11, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            builder_tab,
+            text="Choose the players you would send. Suggestions compare current FantasyCalc values and are starting points, not acceptance predictions.",
+            wraplength=1000,
+        ).pack(anchor="w", pady=(3, 7))
+        builder_controls = ttk.Frame(builder_tab)
+        builder_controls.pack(fill="x", pady=(0, 7))
+        ttk.Label(builder_controls, text="Your team:").pack(side="left")
+        self.trade_builder_team_combo = ttk.Combobox(builder_controls, state="readonly", width=36)
+        self.trade_builder_team_combo.pack(side="left", padx=(8, 16))
+        self.trade_builder_team_combo.bind("<<ComboboxSelected>>", self._trade_builder_team_changed)
+        ttk.Label(builder_controls, text="Max value gap:").pack(side="left")
+        self.trade_builder_tolerance_var = tk.StringVar(value="15%")
+        self.trade_builder_tolerance_combo = ttk.Combobox(
+            builder_controls, textvariable=self.trade_builder_tolerance_var,
+            values=("5%", "10%", "15%", "20%", "25%", "35%"),
+            state="readonly", width=7,
+        )
+        self.trade_builder_tolerance_combo.pack(side="left", padx=(8, 14))
+        self.trade_builder_tolerance_combo.bind("<<ComboboxSelected>>", self._trade_builder_options_changed)
+        ttk.Button(builder_controls, text="Find Matches", command=self._build_trade_suggestions).pack(side="left")
+        builder_content = ttk.Frame(builder_tab)
+        builder_content.pack(fill="both", expand=True)
+        builder_content.columnconfigure(0, weight=1)
+        builder_content.columnconfigure(1, weight=2)
+        builder_content.rowconfigure(0, weight=1)
+        give_box = ttk.LabelFrame(builder_content, text="Players You Would Send", padding=6)
+        return_box = ttk.LabelFrame(builder_content, text="Near-Value Returns", padding=6)
+        give_box.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        return_box.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        builder_search = ttk.Frame(give_box)
+        builder_search.pack(fill="x", pady=(0, 5))
+        ttk.Label(builder_search, text="Search:").pack(side="left")
+        self.trade_builder_search_var = tk.StringVar()
+        ttk.Entry(builder_search, textvariable=self.trade_builder_search_var).pack(
+            side="left", fill="x", expand=True, padx=(6, 0)
+        )
+        self.trade_builder_give_tree = ttk.Treeview(
+            give_box, columns=("position", "value", "slot"),
+            show="tree headings", selectmode="extended", height=10,
+        )
+        self.trade_builder_give_tree.heading("#0", text="Player", command=lambda: self._sort_trade_builder_tree(self.trade_builder_give_tree, "#0"))
+        self.trade_builder_give_tree.heading("position", text="Position", command=lambda: self._sort_trade_builder_tree(self.trade_builder_give_tree, "position"))
+        self.trade_builder_give_tree.heading("value", text="FC Value", command=lambda: self._sort_trade_builder_tree(self.trade_builder_give_tree, "value"))
+        self.trade_builder_give_tree.heading("slot", text="Slot", command=lambda: self._sort_trade_builder_tree(self.trade_builder_give_tree, "slot"))
+        self.trade_builder_give_tree.column("#0", width=170)
+        self.trade_builder_give_tree.column("position", width=75, anchor="center")
+        self.trade_builder_give_tree.column("value", width=75, anchor="e")
+        self.trade_builder_give_tree.column("slot", width=75, anchor="center")
+        give_scroll = ttk.Scrollbar(give_box, orient="vertical", command=self.trade_builder_give_tree.yview)
+        self.trade_builder_give_tree.configure(yscrollcommand=give_scroll.set)
+        self.trade_builder_give_tree.pack(side="left", fill="both", expand=True)
+        give_scroll.pack(side="right", fill="y")
+        self.trade_builder_give_tree.bind("<<TreeviewSelect>>", self._update_trade_builder_selection)
+        self.trade_builder_search_var.trace_add("write", lambda *_: self._filter_trade_builder_roster())
+        self.trade_builder_give_items = []
+        self.trade_builder_selection_var = tk.StringVar(value="Select one or more players to send.")
+        ttk.Label(give_box, textvariable=self.trade_builder_selection_var, wraplength=360).pack(anchor="w", pady=(5, 0))
+        return_filters = ttk.Frame(return_box)
+        return_filters.pack(fill="x", pady=(0, 5))
+        ttk.Label(return_filters, text="Position:").pack(side="left")
+        self.trade_builder_position_filter = ttk.Combobox(
+            return_filters, state="readonly", width=8, values=("Any",),
+        )
+        self.trade_builder_position_filter.set("Any")
+        self.trade_builder_position_filter.pack(side="left", padx=(4, 10))
+        self.trade_builder_position_filter.bind("<<ComboboxSelected>>", self._filter_trade_builder_matches)
+        ttk.Label(return_filters, text="Players received:").pack(side="left")
+        self.trade_builder_package_size_filter = ttk.Combobox(
+            return_filters, state="readonly", width=9, values=("Any", "1", "2", "3"),
+        )
+        self.trade_builder_package_size_filter.set("Any")
+        self.trade_builder_package_size_filter.pack(side="left", padx=(4, 0))
+        self.trade_builder_package_size_filter.bind("<<ComboboxSelected>>", self._filter_trade_builder_matches)
+        self.trade_builder_results_tree = ttk.Treeview(
+            return_box, columns=("players", "positions", "value", "difference", "fit"),
+            show="tree headings", selectmode="browse", height=10,
+        )
+        self.trade_builder_results_tree.heading("#0", text="Trade Partner", command=lambda: self._sort_trade_builder_tree(self.trade_builder_results_tree, "#0"))
+        for key, label in (("players", "You Receive"), ("positions", "Positions"), ("value", "Total Value"),
+                           ("difference", "Value Gap"), ("fit", "Roster Fit")):
+            self.trade_builder_results_tree.heading(key, text=label, command=lambda column=key: self._sort_trade_builder_tree(self.trade_builder_results_tree, column))
+        self.trade_builder_results_tree.column("#0", width=150)
+        self.trade_builder_results_tree.column("players", width=300)
+        self.trade_builder_results_tree.column("positions", width=100, anchor="center")
+        self.trade_builder_results_tree.column("value", width=95, anchor="e")
+        self.trade_builder_results_tree.column("difference", width=100, anchor="e")
+        self.trade_builder_results_tree.column("fit", width=120)
+        results_scroll = ttk.Scrollbar(return_box, orient="vertical", command=self.trade_builder_results_tree.yview)
+        self.trade_builder_results_tree.configure(yscrollcommand=results_scroll.set)
+        self.trade_builder_results_tree.pack(side="left", fill="both", expand=True)
+        results_scroll.pack(side="right", fill="y")
+        self.trade_builder_results_tree.bind("<Double-1>", lambda _event: self._open_trade_builder_match())
+        self.trade_builder_summary = tk.StringVar(value="Select players to find near-value returns from other teams.")
+        builder_actions = ttk.Frame(builder_tab)
+        builder_actions.pack(fill="x", pady=(6, 0))
+        ttk.Label(builder_actions, textvariable=self.trade_builder_summary, wraplength=1100).pack(side="left", fill="x", expand=True)
+        ttk.Button(builder_actions, text="Review Selected Match", command=self._open_trade_builder_match).pack(side="right")
+        self.trade_builder_matches = {}
+        self.trade_builder_all_matches = []
+        self.trade_builder_sort_state = {}
+
         #Show the current operation message and its activity indicator.
         info = ttk.Frame(main)
         info.pack(fill="x", pady=(10, 0))
@@ -1286,7 +1762,7 @@ class App(tk.Tk):
         self.progress = ttk.Progressbar(info, mode="indeterminate")
 
     def _refresh_roster_view(self, _event=None):
-        #Group the selected fantasy team's roster into starters, bench, and reserve.
+        #Show the selected roster, or all league players while a global search is active.
         if not hasattr(self, "roster_tree"):
             return
         if _event is not None:
@@ -1294,20 +1770,28 @@ class App(tk.Tk):
             self.roster_history_points = []
             self.roster_history_detail.set("Select a player to see recent value movement and volatility.")
             self._draw_history_chart(self.roster_history_canvas, [], "Select a player to load a 90-day value trend.")
+        for _group_id, player_id, _owner in self.roster_search_items:
+            if self.roster_tree.exists(player_id):
+                self.roster_tree.delete(player_id)
         for item in self.roster_tree.get_children():
             self.roster_tree.delete(item)
+        self.roster_search_items = []
         if self.dataframes is None:
             return
+        global_search = bool(self.roster_search_var.get().strip())
+        self.roster_search_global_mode = global_search
         roster_id = self._selected_roster_id(self.roster_team_combo)
-        if roster_id is None:
+        if not global_search and roster_id is None:
             return
         roster_rows = self.dataframes["Rosters"]
-        roster_rows = roster_rows[roster_rows["Roster ID"].astype(str) == str(roster_id)]
-        groups = {
+        if not global_search:
+            roster_rows = roster_rows[roster_rows["Roster ID"].astype(str) == str(roster_id)]
+        groups = {} if global_search else {
             "starting": self.roster_tree.insert("", "end", iid="roster-group-start", text="Starting Lineup", open=True),
             "bench": self.roster_tree.insert("", "end", iid="roster-group-bench", text="Bench", open=True),
             "reserve": self.roster_tree.insert("", "end", iid="roster-group-reserve", text="IR / Reserve", open=True),
         }
+        owner_groups = {}
         position_order = {position: index for index, position in enumerate(("QB", "RB", "WR", "TE", "K", "DEF", "DST"))}
         ordered_rows = list(roster_rows.iterrows())
         ordered_rows.sort(key=lambda item: (
@@ -1319,9 +1803,18 @@ class App(tk.Tk):
         ))
         for _index, row in ordered_rows:
             slot = str(row.get("Slot", "")).strip()
-            group = "reserve" if slot.casefold() in {"reserve", "ir"} else (
-                "bench" if slot.casefold() == "bench" else "starting"
-            )
+            owner = str(row.get("Team", "Unknown team"))
+            if global_search:
+                group = owner_groups.get(owner)
+                if group is None:
+                    group = f"roster-owner-{len(owner_groups)}"
+                    owner_groups[owner] = group
+                    self.roster_tree.insert("", "end", iid=group, text=owner, open=True)
+            else:
+                group = "reserve" if slot.casefold() in {"reserve", "ir"} else (
+                    "bench" if slot.casefold() == "bench" else "starting"
+                )
+                group = groups[group]
             player_id = str(row.get("Player ID", ""))
             team_code = self._normalize_nfl_team_code(row.get("NFL Team", ""))
             bye = self.weekly_bye_weeks.get(team_code) or (
@@ -1331,10 +1824,45 @@ class App(tk.Tk):
             projection_text = f"{projection:.1f}" if projection is not None else "—"
             status_row = {"Status": row.get("Status"), "Injury Status": row.get("Injury Status"), "Slot": slot}
             self.roster_tree.insert(
-                groups[group], "end", iid=player_id, text=str(row.get("Player", player_id)),
+                group, "end", iid=player_id, text=str(row.get("Player", player_id)),
                 values=(slot, row.get("Position", ""), row.get("NFL Team", ""),
                         self._player_list_status(status_row), bye, projection_text),
             )
+            self.roster_search_items.append((group, player_id, owner))
+        self._apply_roster_search()
+
+    def _apply_roster_search(self):
+        #Filter the loaded roster scope and rebuild when switching between local and global search.
+        if not hasattr(self, "roster_tree"):
+            return
+        query = self.roster_search_var.get().strip().casefold()
+        global_search = bool(query)
+        if global_search != getattr(self, "roster_search_global_mode", False):
+            self._refresh_roster_view()
+            return
+        shown = 0
+        for group_id, player_id, owner in self.roster_search_items:
+            if not self.roster_tree.exists(player_id):
+                continue
+            searchable = " ".join((
+                str(self.roster_tree.item(player_id, "text")),
+                owner,
+                *(str(value) for value in self.roster_tree.item(player_id, "values")),
+            )).casefold()
+            if not query or query in searchable:
+                self.roster_tree.move(player_id, group_id, "end")
+                shown += 1
+            else:
+                self.roster_tree.detach(player_id)
+        total = len(self.roster_search_items)
+        if not total:
+            self.roster_search_status.set("Load a league to search its roster.")
+        elif query and shown == 0:
+            self.roster_search_status.set("No players match across the league's rosters.")
+        elif query:
+            self.roster_search_status.set(f"Searching all league rosters · showing {shown} of {total} players.")
+        else:
+            self.roster_search_status.set(f"Showing {shown} of {total} players on the selected roster.")
 
     def _load_roster_projections(self):
         #Request current-week point projections when Sleeper has published them.
@@ -1394,23 +1922,84 @@ class App(tk.Tk):
             height = min(950, self.winfo_screenheight())
             self.geometry(f"{width}x{height}+0+0")
 
+    def _scroll_trade_tab(self, event):
+        #Use the mouse wheel to reach lower Trade Review sections on short displays.
+        if self.workspace.select() != str(self.trade_tab):
+            return
+        if event.widget.winfo_toplevel() is not self:
+            return
+        if isinstance(event.widget, (ttk.Treeview, ttk.Combobox)):
+            return
+        units = -1 * int(event.delta / 120) if event.delta else 0
+        if units:
+            self.trade_tab_canvas.yview_scroll(units, "units")
+            return "break"
+
+    def _compact_tree_columns(self):
+        #Keep list columns close to their configured widths instead of stretching across wide monitors.
+        pending = [self]
+        while pending:
+            parent = pending.pop()
+            for child in parent.winfo_children():
+                pending.append(child)
+                if isinstance(child, ttk.Treeview):
+                    for column in ("#0", *child["columns"]):
+                        child.column(column, stretch=False)
+
     def _show_lineup_impact(self):
         #Show detailed lineup notes on demand to keep the trade screen uncluttered.
         messagebox.showinfo("Roster and Lineup Impact", self.trade_impact_var.get())
 
+    def _bye_week_for_player(self, row):
+        #Prefer the schedule-derived bye because Sleeper's player map often omits it.
+        team_code = self._normalize_nfl_team_code(row.get("NFL Team", ""))
+        bye_week = self.weekly_bye_weeks.get(team_code)
+        if bye_week:
+            return str(bye_week)
+        sleeper_bye = row.get("Bye Week")
+        if pd.notna(sleeper_bye) and str(sleeper_bye).strip():
+            return str(sleeper_bye)
+        return "—"
+
+    def _refresh_trade_bye_weeks(self):
+        #Update the bye column in place so async schedule loading keeps current selections.
+        if self.dataframes is None:
+            return
+        rosters = self.dataframes["Rosters"]
+        rows_by_player = {
+            str(row["Player ID"]): row for _, row in rosters.iterrows()
+        }
+        for tree in (self.trade_left_tree, self.trade_right_tree):
+            for iid in tree.get_children():
+                tags = tree.item(iid, "tags")
+                row = rows_by_player.get(str(tags[0])) if tags else None
+                if row is None:
+                    continue
+                values = list(tree.item(iid, "values"))
+                if len(values) > 3:
+                    values[3] = self._bye_week_for_player(row)
+                    tree.item(iid, values=values)
+
     def _make_trade_tree(self, parent):
         #Create a sortable, multi-select roster list for either side of a trade.
-        tree = ttk.Treeview(parent, columns=("position", "status", "team", "value"), show="tree headings", selectmode="extended", height=12)
+        visible_rows = 8 if self.winfo_screenheight() > 1200 else (4 if self.winfo_screenheight() <= 1100 else 6)
+        tree = ttk.Treeview(parent, columns=("position", "status", "team", "bye", "position_rank", "overall_rank", "value"), show="tree headings", selectmode="extended", height=visible_rows)
         tree.heading("#0", text="Player", command=lambda t=tree: self._sort_trade_tree(t, "name"))
         tree.heading("position", text="Position", command=lambda t=tree: self._sort_trade_tree(t, "position"))
         tree.heading("status", text="Status", command=lambda t=tree: self._sort_trade_tree(t, "status"))
         tree.heading("team", text="Team", command=lambda t=tree: self._sort_trade_tree(t, "team"))
+        tree.heading("bye", text="Bye")
+        tree.heading("position_rank", text="FC Pos Rank")
+        tree.heading("overall_rank", text="FC Overall")
         tree.heading("value", text="FC Value", command=lambda t=tree: self._sort_trade_tree(t, "value"))
         tree.column("#0", width=145)
         tree.column("position", width=58, anchor="center")
-        tree.column("status", width=100, anchor="center")
-        tree.column("team", width=55, anchor="center")
-        tree.column("value", width=75, anchor="e")
+        tree.column("status", width=85, anchor="center")
+        tree.column("team", width=48, anchor="center")
+        tree.column("bye", width=42, anchor="center")
+        tree.column("position_rank", width=74, anchor="center")
+        tree.column("overall_rank", width=66, anchor="center")
+        tree.column("value", width=74, anchor="e")
         return tree
 
     def write_log(self, text):
@@ -1476,6 +2065,12 @@ class App(tk.Tk):
                     player_id = str(row["Player ID"])
                     market = self.fantasycalc_values.get(player_id)
                     shown_value = f'{market:,.0f}' if market is not None else "N/A"
+                    bye = self._bye_week_for_player(row)
+                    position_ranks = self.fantasycalc_position_ranks.get(player_id, {})
+                    position_rank = " / ".join(
+                        f"{position} {rank}" for position, rank in position_ranks.items()
+                    ) or "—"
+                    overall_rank = self.fantasycalc_overall_ranks.get(player_id, "—")
                     name = str(row["Player"])
                     last_name = str(row.get("Last Name") or name.rsplit(" ", 1)[-1])
                     first_name = str(row.get("First Name") or "")
@@ -1488,7 +2083,7 @@ class App(tk.Tk):
                     }
                     tree.insert("", "end", iid=f"{id(tree)}-{player_id}",
                                 text=row["Player"], values=(row["Position"], self._player_list_status(row),
-                                                            row["NFL Team"] or "—", shown_value),
+                                                            row["NFL Team"] or "—", bye, position_rank, overall_rank, shown_value),
                                 tags=(player_id,))
                 self._sort_trade_tree(tree, "position", toggle=False)
         finally:
@@ -1538,6 +2133,62 @@ class App(tk.Tk):
         for index, item in enumerate(ordered):
             tree.move(item, "", index)
 
+    def _sort_trade_builder_tree(self, tree, column):
+        #Sort builder rows by the selected field, toggling direction on repeated clicks.
+        tree_key = "give" if tree is self.trade_builder_give_tree else "results"
+        state = self.trade_builder_sort_state.setdefault(tree_key, {})
+        reverse = not state[column] if column in state else column == "value"
+        state[column] = reverse
+        items = list(tree.get_children(""))
+
+        if tree_key == "give":
+            def sort_key(item):
+                if column == "#0":
+                    return str(tree.item(item, "text")).casefold()
+                values = tree.item(item, "values")
+                index = {"position": 0, "slot": 2}[column]
+                return str(values[index] if len(values) > index else "").casefold()
+
+            if column == "value":
+                def order_by_value(player_ids):
+                    known = [item for item in player_ids if self.fantasycalc_values.get(str(item)) is not None]
+                    missing = [item for item in player_ids if self.fantasycalc_values.get(str(item)) is None]
+                    known.sort(key=lambda item: self.fantasycalc_values[str(item)], reverse=reverse)
+                    return known + missing
+                items = order_by_value(items)
+                self.trade_builder_give_items = order_by_value(self.trade_builder_give_items)
+            else:
+                items.sort(key=sort_key, reverse=reverse)
+                self.trade_builder_give_items.sort(key=sort_key, reverse=reverse)
+            self._filter_trade_builder_roster()
+        else:
+            def sort_key(item):
+                match = self.trade_builder_matches.get(item, {})
+                if column == "#0":
+                    return str(match.get("partner", "")).casefold()
+                if column == "players":
+                    return " + ".join(asset["name"] for asset in match.get("receive_assets", [])).casefold()
+                if column == "positions":
+                    return " + ".join(asset["position"] for asset in match.get("receive_assets", [])).casefold()
+                if column == "value":
+                    return match.get("receive_value", 0)
+                if column == "difference":
+                    return match.get("gap", 0)
+                if column == "fit":
+                    return match.get("fit_order", 99)
+                return ""
+
+            if column == "#0":
+                items.sort(key=lambda item: str(tree.item(item, "text")).casefold(), reverse=reverse)
+                for index, item in enumerate(items):
+                    tree.move(item, "", index)
+            else:
+                for group in items:
+                    children = list(tree.get_children(group))
+                    children.sort(key=sort_key, reverse=reverse)
+                    for index, item in enumerate(children):
+                        tree.move(item, group, index)
+
     @staticmethod
     def _player_list_status(row):
         #Prefer a current injury designation, then show IR/reserve or Sleeper's general status.
@@ -1550,6 +2201,40 @@ class App(tk.Tk):
             return "IR"
         return player_status or "—"
 
+    def _update_trade_balance(self, give_value=None, receive_value=None):
+        #Show the relative value split, centered when both sides are even.
+        canvas = self.trade_balance_canvas
+        canvas.delete("all")
+        canvas.configure(bg=self.theme_colors["background"])
+        width, height = 260, 18
+        left, right, top, bottom = 2, width - 2, 3, height - 3
+        center = (left + right) / 2
+        colors = self.theme_colors
+        canvas.create_rectangle(left, top, center, bottom, fill="#9b5c5c", outline="")
+        canvas.create_rectangle(center, top, right, bottom, fill="#4d9568", outline="")
+        canvas.create_line(center, top - 1, center, bottom + 1, fill=colors["foreground"], width=1)
+        if give_value is None or receive_value is None:
+            self.trade_balance_summary.set("Select players on both sides.")
+            marker = center
+        else:
+            denominator = max(give_value, receive_value)
+            if denominator <= 0:
+                difference = 0
+                gap = 0
+            else:
+                difference = receive_value - give_value
+                gap = abs(difference) / denominator
+            marker = center + (difference / denominator if denominator > 0 else 0) * (right - left) / 2
+            if gap <= 0.10:
+                self.trade_balance_summary.set(f"Close value · {gap:.0%} gap")
+            elif difference > 0:
+                self.trade_balance_summary.set(f"You receive more · {gap:.0%} gap")
+            else:
+                self.trade_balance_summary.set(f"You give more · {gap:.0%} gap")
+        marker = min(max(marker, left + 3), right - 3)
+        canvas.create_line(marker, top - 2, marker, bottom + 2,
+                           fill=colors["foreground"], width=3)
+
     def _update_trade_review(self, _event=None):
         #Recalculate market totals and update the positional roster impact as selections change.
         if self._trade_populating:
@@ -1557,6 +2242,7 @@ class App(tk.Tk):
         self._update_position_impact()
         give_selection = self.trade_left_tree.selection()
         get_selection = self.trade_right_tree.selection()
+        self._update_trade_text_preview()
         self.copy_trade_button.configure(
             state="normal" if give_selection and get_selection else "disabled"
         )
@@ -1565,14 +2251,19 @@ class App(tk.Tk):
         self._update_stats_guy_trade_review(give_ids, get_ids)
         self._refresh_trade_history(give_selection, get_selection)
         if not give_ids and not get_ids:
+            self._update_trade_balance()
             self.trade_result_var.set("Select players on either side to compare their FantasyCalc values.")
             return
         unknown = [pid for pid in give_ids + get_ids if pid not in self.fantasycalc_values]
         if unknown:
+            self._update_trade_balance()
             self.trade_result_var.set("Values are unavailable for one or more selected players. Try refreshing later.")
             return
         give_value = sum(self.fantasycalc_values[pid] for pid in give_ids)
         get_value = sum(self.fantasycalc_values[pid] for pid in get_ids)
+        self._update_trade_balance(
+            give_value if give_ids else None, get_value if get_ids else None
+        )
         difference = get_value - give_value
         prefix = "You give: none" if not give_ids else f"You give: {give_value:,.0f}"
         receive = "You receive: none" if not get_ids else f"You receive: {get_value:,.0f}"
@@ -1628,13 +2319,26 @@ class App(tk.Tk):
                 text += f" Stats Guy leans toward you giving {abs(difference):,.0f} more value."
         self.trade_stats_guy_result_var.set(text)
 
-    def _copy_trade_text(self):
-        #Copy the selected proposal using the user's perspective for sharing in chat.
+    def _selected_trade_copy_text(self):
+        #Build the same user-perspective text for the live preview and clipboard action.
         give_players = [self.trade_left_tree.item(iid, "text") for iid in self.trade_left_tree.selection()]
         get_players = [self.trade_right_tree.item(iid, "text") for iid in self.trade_right_tree.selection()]
         if not give_players or not get_players:
+            return None
+        return f"I get: {', '.join(get_players)}\nI send: {', '.join(give_players)}"
+
+    def _update_trade_text_preview(self):
+        #Keep the visible preview exactly aligned with what the copy button will produce.
+        self.copy_trade_preview_var.set(
+            self._selected_trade_copy_text()
+            or "Select at least one player from each team to preview the copied text."
+        )
+
+    def _copy_trade_text(self):
+        #Copy the same proposal shown below the player lists.
+        trade_text = self._selected_trade_copy_text()
+        if not trade_text:
             return
-        trade_text = f"I get: {', '.join(get_players)}\nI send: {', '.join(give_players)}"
         self.clipboard_clear()
         self.clipboard_append(trade_text)
         self.update()
@@ -1805,6 +2509,315 @@ class App(tk.Tk):
             self.trade_right_team.get() + "\n" + right_lineup
         )
 
+    def _clear_trade_builder_matches(self, message="Select players to find near-value returns from other teams."):
+        #Remove suggestions as soon as their offer inputs change.
+        for item in self.trade_builder_results_tree.get_children():
+            self.trade_builder_results_tree.delete(item)
+        self.trade_builder_matches.clear()
+        self.trade_builder_all_matches = []
+        self.trade_builder_summary.set(message)
+
+    def _trade_builder_options_changed(self, _event=None):
+        #Require a fresh search after changing the selected team or value tolerance.
+        self._clear_trade_builder_matches("Trade settings changed. Find Matches to refresh suggestions.")
+
+    def _trade_builder_team_changed(self, _event=None):
+        #Reload the offer roster and discard stale results when the builder team changes.
+        self._clear_trade_builder_matches()
+        self._refresh_trade_builder_roster()
+
+    def _refresh_trade_builder_roster(self):
+        #List every player on the selected team with their current FantasyCalc value.
+        tree = self.trade_builder_give_tree
+        selected_before_refresh = set(tree.selection())
+        for item in self.trade_builder_give_items:
+            if tree.exists(item):
+                tree.delete(item)
+        for item in tree.get_children():
+            tree.delete(item)
+        self.trade_builder_give_items = []
+        if self.dataframes is None:
+            return
+        roster_id = self._selected_roster_id(self.trade_builder_team_combo)
+        if roster_id is None:
+            return
+        rows = self.dataframes["Rosters"]
+        rows = rows[rows["Roster ID"].astype(str) == str(roster_id)]
+        position_order = {position: index for index, position in enumerate(("QB", "RB", "WR", "TE", "K", "DEF", "DST"))}
+        ordered_rows = list(rows.iterrows())
+        ordered_rows.sort(key=lambda item: (
+            2 if str(item[1].get("Slot", "")).casefold() in {"reserve", "ir"} else
+            1 if str(item[1].get("Slot", "")).casefold() == "bench" else 0,
+            item[1].get("Lineup Order") if pd.notna(item[1].get("Lineup Order")) else
+            item[1].get("Roster Order", 999),
+            position_order.get(str(item[1].get("Position", "")).split(",")[0].strip().upper(), 99),
+        ))
+        for _, row in ordered_rows:
+            player_id = str(row["Player ID"])
+            value = self.fantasycalc_values.get(player_id)
+            shown_value = f"{value:,.0f}" if value is not None else "N/A"
+            self.trade_builder_give_tree.insert(
+                "", "end", iid=player_id, text=str(row["Player"]), tags=(player_id,),
+                values=(row.get("Position", ""), shown_value, row.get("Slot", "")),
+            )
+            self.trade_builder_give_items.append(player_id)
+            if player_id in selected_before_refresh:
+                self.trade_builder_give_tree.selection_add(player_id)
+        self._filter_trade_builder_roster()
+        self._update_trade_builder_selection()
+
+    def _filter_trade_builder_roster(self):
+        #Search player name, position, and lineup slot while retaining selected assets.
+        if not hasattr(self, "trade_builder_give_tree"):
+            return
+        query = self.trade_builder_search_var.get().strip().casefold()
+        for player_id in self.trade_builder_give_items:
+            if not self.trade_builder_give_tree.exists(player_id):
+                continue
+            searchable = " ".join((
+                str(self.trade_builder_give_tree.item(player_id, "text")),
+                *(str(value) for value in self.trade_builder_give_tree.item(player_id, "values")),
+            )).casefold()
+            if not query or query in searchable:
+                self.trade_builder_give_tree.move(player_id, "", "end")
+            else:
+                self.trade_builder_give_tree.detach(player_id)
+
+    def _refresh_trade_builder_values(self):
+        #Refresh displayed market values without clearing the builder's player selection.
+        if not hasattr(self, "trade_builder_give_tree"):
+            return
+        for player_id in self.trade_builder_give_items:
+            if not self.trade_builder_give_tree.exists(player_id):
+                continue
+            values = list(self.trade_builder_give_tree.item(player_id, "values"))
+            value = self.fantasycalc_values.get(str(player_id))
+            if len(values) > 1:
+                values[1] = f"{value:,.0f}" if value is not None else "N/A"
+                self.trade_builder_give_tree.item(player_id, values=values)
+        self._update_trade_builder_selection()
+
+    def _update_trade_builder_selection(self, _event=None):
+        #Summarize the offer and invalidate results tied to the previous selection.
+        if hasattr(self, "trade_builder_results_tree"):
+            self._clear_trade_builder_matches("Offer changed. Find Matches to refresh suggestions.")
+        selected = self.trade_builder_give_tree.selection()
+        if not selected:
+            self.trade_builder_selection_var.set("Select one or more players to send.")
+            return
+        missing = [iid for iid in selected if str(iid) not in self.fantasycalc_values]
+        if missing:
+            self.trade_builder_selection_var.set(
+                f"{len(selected)} selected · value unavailable for {len(missing)} player(s)."
+            )
+            return
+        total = sum(self.fantasycalc_values[str(iid)] for iid in selected)
+        self.trade_builder_selection_var.set(f"{len(selected)} selected · total FC value {total:,.0f}.")
+
+    def _build_trade_suggestions(self):
+        #Search one-to-three-player returns across opponent rosters by market-value distance.
+        tree = self.trade_builder_results_tree
+        for item in tree.get_children():
+            tree.delete(item)
+        self.trade_builder_matches.clear()
+        if self.dataframes is None:
+            self.trade_builder_summary.set("Load a league before building a trade.")
+            return
+        selected = self.trade_builder_give_tree.selection()
+        if not selected:
+            self.trade_builder_summary.set("Select at least one player you would send.")
+            return
+        missing = [iid for iid in selected if str(iid) not in self.fantasycalc_values]
+        if missing:
+            self.trade_builder_summary.set("Wait for FantasyCalc values to load before searching.")
+            return
+        own_roster_id = self._selected_roster_id(self.trade_builder_team_combo)
+        if own_roster_id is None:
+            self.trade_builder_summary.set("Choose your team first.")
+            return
+        give_assets = []
+        for player_id in selected:
+            row = self.dataframes["Rosters"]
+            row = row[(row["Roster ID"].astype(str) == str(own_roster_id)) &
+                      (row["Player ID"].astype(str) == str(player_id))]
+            if row.empty:
+                continue
+            player = row.iloc[0]
+            give_assets.append({
+                "id": str(player_id), "name": str(player["Player"]),
+                "position": str(player["Position"]),
+                "value": self.fantasycalc_values[str(player_id)],
+            })
+        if not give_assets:
+            self.trade_builder_summary.set("The selected players are no longer on this roster.")
+            return
+        give_value = sum(asset["value"] for asset in give_assets)
+        if give_value <= 0:
+            self.trade_builder_summary.set("Selected players have no positive FantasyCalc value.")
+            return
+        try:
+            tolerance = float(self.trade_builder_tolerance_var.get().rstrip("%")) / 100
+        except ValueError:
+            tolerance = 0.15
+        needs_data = self.dataframes.get("Position Needs", pd.DataFrame())
+
+        def needs_for(roster_id):
+            if needs_data.empty or "Roster ID" not in needs_data:
+                return set()
+            team_needs = needs_data[needs_data["Roster ID"].astype(str) == str(roster_id)]
+            return {str(row["Position"]).upper() for _, row in team_needs.iterrows()
+                    if str(row.get("Assessment", "")) != "Covered"}
+
+        own_needs = needs_for(own_roster_id)
+        give_positions = {part.strip().upper() for asset in give_assets
+                          for part in asset["position"].split(",") if part.strip()}
+        roster_rows = self.dataframes["Rosters"]
+        matches = []
+        for partner, partner_roster_id in self.team_options:
+            if str(partner_roster_id) == str(own_roster_id):
+                continue
+            team_rows = roster_rows[roster_rows["Roster ID"].astype(str) == str(partner_roster_id)]
+            candidates = []
+            for _, player in team_rows.iterrows():
+                player_id = str(player["Player ID"])
+                value = self.fantasycalc_values.get(player_id)
+                if value is None or value <= 0:
+                    continue
+                candidates.append({
+                    "id": player_id, "name": str(player["Player"]),
+                    "position": str(player["Position"]), "value": value,
+                })
+            candidates.sort(key=lambda asset: (-asset["value"], asset["name"].casefold()))
+            partner_needs = needs_for(partner_roster_id)
+            for count in range(1, min(3, len(candidates)) + 1):
+                for package in itertools.combinations(candidates, count):
+                    receive_value = sum(asset["value"] for asset in package)
+                    gap = abs(receive_value - give_value) / max(receive_value, give_value)
+                    if gap > tolerance:
+                        continue
+                    receive_positions = {part.strip().upper() for asset in package
+                                         for part in asset["position"].split(",") if part.strip()}
+                    offer_fit = bool(give_positions & partner_needs)
+                    receive_fit = bool(receive_positions & own_needs)
+                    if offer_fit and receive_fit:
+                        fit, fit_order = "Both sides", 0
+                    elif offer_fit or receive_fit:
+                        fit, fit_order = "One side", 1
+                    else:
+                        fit, fit_order = "Value only", 2
+                    matches.append({
+                        "id": uuid.uuid4().hex,
+                        "partner": partner, "partner_roster_id": str(partner_roster_id),
+                        "own_roster_id": str(own_roster_id), "give_assets": give_assets,
+                        "receive_assets": list(package), "give_value": give_value,
+                        "receive_value": receive_value, "gap": gap,
+                        "fit": fit, "fit_order": fit_order,
+                    })
+        matches.sort(key=lambda match: (
+            match["gap"], match["fit_order"], len(match["receive_assets"]),
+            match["partner"].casefold(),
+        ))
+        self.trade_builder_all_matches = matches
+        self.trade_builder_search_context = {"tolerance": tolerance, "give_value": give_value}
+        assets = [asset for match in matches for asset in match["receive_assets"]]
+        self._set_trade_builder_filter_values(
+            self.trade_builder_position_filter,
+            sorted({position for asset in assets for position in asset["position"].split(",") if position.strip()}),
+        )
+        self._filter_trade_builder_matches()
+
+    @staticmethod
+    def _set_trade_builder_filter_values(combo, options):
+        #Refresh a builder filter while retaining its selection when still available.
+        current = combo.get() or "Any"
+        values = ["Any", *options]
+        combo.configure(values=values)
+        combo.set(current if current in values else "Any")
+
+    def _filter_trade_builder_matches(self, _event=None):
+        #Filter packages by a return player's position and number of players received.
+        tree = self.trade_builder_results_tree
+        for item in tree.get_children():
+            tree.delete(item)
+        self.trade_builder_matches.clear()
+        position = self.trade_builder_position_filter.get()
+        package_size = self.trade_builder_package_size_filter.get()
+        filtered = []
+        for match in self.trade_builder_all_matches:
+            matches_size = package_size == "Any" or len(match["receive_assets"]) == int(package_size)
+            matches_position = position == "Any" or any(
+                position.upper() in {part.strip().upper() for part in asset["position"].split(",")}
+                for asset in match["receive_assets"]
+            )
+            if matches_size and matches_position:
+                filtered.append(match)
+
+        partner_groups = {}
+        for match in filtered[:200]:
+            group_id = partner_groups.get(match["partner"])
+            if group_id is None:
+                group_id = f"builder-partner-{len(partner_groups)}"
+                partner_groups[match["partner"]] = group_id
+                tree.insert("", "end", iid=group_id, text=match["partner"], open=True)
+            iid = match["id"]
+            players = " + ".join(asset["name"] for asset in match["receive_assets"])
+            positions = " + ".join(asset["position"] for asset in match["receive_assets"])
+            difference = match["receive_value"] - match["give_value"]
+            tree.insert(
+                group_id, "end", iid=iid,
+                text=f"{len(match['receive_assets'])}-player return",
+                values=(players, positions, f"{match['receive_value']:,.0f}",
+                        f"{difference:+,.0f} ({match['gap']:.0%})", match["fit"]),
+            )
+            self.trade_builder_matches[iid] = match
+        shown = min(len(filtered), 200)
+        context = getattr(self, "trade_builder_search_context", {})
+        tolerance = context.get("tolerance", 0.15)
+        give_value = context.get("give_value", 0)
+        if filtered:
+            self.trade_builder_summary.set(
+                f"Showing {shown} of {len(filtered)} matching package(s) within {tolerance:.0%} of "
+                f"{give_value:,.0f}. Expand a team to see its return packages."
+            )
+        elif self.trade_builder_all_matches:
+            self.trade_builder_summary.set("No return packages match these filters. Choose Any or adjust the filters.")
+        elif context:
+            self.trade_builder_summary.set(
+                f"No return packages within {tolerance:.0%} of {give_value:,.0f}. Try a wider value gap."
+            )
+
+    def _open_trade_builder_match(self):
+        #Load the selected package into Trade Review so it can be edited and assessed.
+        selection = self.trade_builder_results_tree.selection()
+        if not selection:
+            messagebox.showinfo("Choose a Match", "Select a suggested return package first.")
+            return
+        match = self.trade_builder_matches.get(selection[0])
+        if not match:
+            return
+        left_index = next((index for index, (_label, roster_id) in enumerate(self.team_options)
+                           if str(roster_id) == match["own_roster_id"]), None)
+        right_index = next((index for index, (_label, roster_id) in enumerate(self.team_options)
+                            if str(roster_id) == match["partner_roster_id"]), None)
+        if left_index is None or right_index is None:
+            return
+        self._new_trade()
+        self.trade_left_team.current(left_index)
+        self.trade_right_team.current(right_index)
+        self._populate_trade_rosters()
+        wanted = (
+            (self.trade_left_tree, {asset["id"] for asset in match["give_assets"]}),
+            (self.trade_right_tree, {asset["id"] for asset in match["receive_assets"]}),
+        )
+        for trade_tree, player_ids in wanted:
+            for iid in trade_tree.get_children():
+                tags = trade_tree.item(iid, "tags")
+                if tags and str(tags[0]) in player_ids:
+                    trade_tree.selection_add(iid)
+        self.trade_note_var.set(f"Trade Builder suggestion · {match['partner']} · {match['gap']:.0%} value gap")
+        self.workspace.select(self.trade_tab)
+        self._update_trade_review()
+
     def _refresh_trade_ideas(self, _event=None):
         #Find reciprocal depth fits and rank candidate one-for-one deals by value gap.
         if self.dataframes is None or not hasattr(self, "trade_ideas_tree"):
@@ -1900,12 +2913,22 @@ class App(tk.Tk):
                                     idea["gap"] if idea["gap"] is not None else 1,
                                     idea["partner"].casefold(),
                                     idea["offer"]["name"].casefold()))
+        partner_groups = {}
         for idea in ideas[:100]:
             item_id = uuid.uuid4().hex
             offer_value = idea["offer"]["value"]
             target_value = idea["target"]["value"]
+            group_id = partner_groups.get(idea["partner"])
+            if group_id is None:
+                group_id = f"trade-partner-{len(partner_groups)}"
+                partner_groups[idea["partner"]] = group_id
+                self.trade_ideas_tree.insert(
+                    "", "end", iid=group_id, text=idea["partner"], open=True,
+                    values=("", "", "", "", "", ""), tags=("partner",),
+                )
             self.trade_ideas_tree.insert(
-                "", "end", iid=item_id, text=idea["partner"],
+                group_id, "end", iid=item_id,
+                text=f"{idea['offer']['name']} for {idea['target']['name']}",
                 values=(idea["match"], idea["offer"]["name"],
                         f"{offer_value:,.0f}" if offer_value is not None else "N/A",
                         idea["target"]["name"],
@@ -1914,7 +2937,7 @@ class App(tk.Tk):
             )
             self.trade_ideas_by_id[item_id] = idea
         self.trade_ideas_summary.set(
-            f"Showing {min(len(ideas), 100)} potential one-for-one fit(s). "
+            f"Showing {min(len(ideas), 100)} potential one-for-one fit(s) across {len(partner_groups)} team(s). "
             "Open an idea to adjust it and review the full trade."
             if ideas else
             "No reciprocal bench-depth fits found. Check position needs or try a different team."
@@ -1975,6 +2998,150 @@ class App(tk.Tk):
             return str(self.dataframes["League Info"].iloc[0].get("League ID", ""))
         return ""
 
+    def _export_saved_trades(self):
+        #Save the current league's complete saved-trade tree as a portable JSON file.
+        league_id = self._current_league_id()
+        if not league_id or self.dataframes is None:
+            messagebox.showwarning("No League Loaded", "Load a league before exporting saved trades.")
+            return
+        records = self._saved_trade_records()
+        if not records:
+            messagebox.showinfo("No Saved Trades", "There are no saved trades to export for this league.")
+            return
+        league = self.selected_league() or {}
+        league_info = self.dataframes["League Info"].iloc[0]
+        payload = {
+            "format": "sleeper-fantasy-calculator-saved-trades",
+            "version": 1,
+            "exported_at": datetime.now().astimezone().isoformat(timespec="minutes"),
+            "league": {
+                "id": league_id,
+                "name": str(league.get("name") or league_info.get("League Name", "")),
+                "season": str(league.get("season", league_info.get("Season", ""))),
+            },
+            "trades": records,
+        }
+        path = filedialog.asksaveasfilename(
+            title="Export Saved Trades", defaultextension=".json",
+            initialfile=f"saved-trades-{league_id}.json",
+            filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as destination:
+                json.dump(payload, destination, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            messagebox.showerror("Export Failed", f"Could not write the saved-trades file.\n\n{exc}")
+            return
+        self.status(f"Exported {len(records)} saved trade(s).")
+
+    def _import_saved_trades(self):
+        #Merge a saved-trades file into the active league without replacing local records.
+        league_id = self._current_league_id()
+        if not league_id or self.dataframes is None:
+            messagebox.showwarning("No League Loaded", "Load the destination league before importing trades.")
+            return
+        path = filedialog.askopenfilename(
+            title="Import Saved Trades",
+            filetypes=(("Saved trade JSON", "*.json"), ("All files", "*.*")),
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as source:
+                payload = json.load(source)
+        except (OSError, ValueError, UnicodeError) as exc:
+            messagebox.showerror("Import Failed", f"Could not read that JSON file.\n\n{exc}")
+            return
+        if (not isinstance(payload, dict) or
+                payload.get("format") != "sleeper-fantasy-calculator-saved-trades" or
+                payload.get("version") != 1 or not isinstance(payload.get("trades"), list) or
+                not isinstance(payload.get("league"), dict)):
+            messagebox.showerror("Unsupported File", "Choose a saved-trades JSON export from this app.")
+            return
+        source_league = payload.get("league") or {}
+        source_id = str(source_league.get("id", ""))
+        if source_id and source_id != league_id:
+            label = source_league.get("name") or source_id
+            if not messagebox.askyesno(
+                "League Does Not Match",
+                f"This file was exported from {label}. Import those trades into the selected league?",
+            ):
+                return
+
+        def valid_trade(trade):
+            if not isinstance(trade, dict):
+                return False
+            for side in ("give_players", "get_players"):
+                assets = trade.get(side)
+                if not isinstance(assets, list) or not assets or any(
+                    not isinstance(asset, dict) or not asset.get("id") or not asset.get("name")
+                    for asset in assets
+                ):
+                    return False
+            children = trade.get("counter_offers", [])
+            return isinstance(children, list) and all(valid_trade(child) for child in children)
+
+        imported = payload["trades"]
+        if not all(valid_trade(trade) for trade in imported):
+            messagebox.showerror("Invalid Trade Data", "The file contains a trade with invalid player data.")
+            return
+        current = self.saved_trades.setdefault(league_id, [])
+        known_ids = set()
+
+        def collect_ids(records):
+            for record in records:
+                if record.get("id"):
+                    known_ids.add(str(record["id"]))
+                collect_ids(record.get("counter_offers", []))
+
+        collect_ids(current)
+        used_ids = set(known_ids)
+        imported_count = 0
+        skipped_count = 0
+
+        def clone_trade(record, parent_id=None):
+            nonlocal imported_count, skipped_count
+            record_id = str(record.get("id") or uuid.uuid4().hex)
+            if record_id in used_ids:
+                skipped_count += 1
+                return None
+            used_ids.add(record_id)
+            cloned = dict(record)
+            cloned["id"] = record_id
+            cloned["league_id"] = league_id
+            if parent_id:
+                cloned["parent_trade_id"] = parent_id
+            else:
+                cloned.pop("parent_trade_id", None)
+            cloned["counter_offers"] = []
+            imported_count += 1
+            for child in record.get("counter_offers", []):
+                imported_child = clone_trade(child, record_id)
+                if imported_child is not None:
+                    cloned["counter_offers"].append(imported_child)
+            return cloned
+
+        merged = []
+        for record in imported:
+            cloned = clone_trade(record)
+            if cloned is not None:
+                merged.append(cloned)
+        if not merged:
+            messagebox.showinfo("Nothing to Import", "Every trade in this file is already present.")
+            return
+        current.extend(merged)
+        try:
+            self._persist_saved_trades()
+        except OSError as exc:
+            del current[-len(merged):]
+            messagebox.showerror("Import Failed", f"Could not save the imported trades.\n\n{exc}")
+            return
+        self._refresh_saved_trades_view()
+        duplicate_note = f" Skipped {skipped_count} duplicate trade(s)." if skipped_count else ""
+        self.status(f"Imported {imported_count} trade(s).{duplicate_note}")
+
     def _saved_trade_records(self):
         #Return only the saved proposals for the currently selected league.
         return self.saved_trades.get(self._current_league_id(), [])
@@ -2014,25 +3181,16 @@ class App(tk.Tk):
         for item in self.saved_trade_tree.get_children():
             self.saved_trade_tree.delete(item)
         records = self._saved_trade_records()
+        opponent_groups = {}
         for trade in records:
-            give_value, give_complete = self._saved_trade_side_value(trade.get("give_players", []))
-            receive_value, receive_complete = self._saved_trade_side_value(trade.get("get_players", []))
-            complete = give_complete and receive_complete
-            format_value = lambda amount, ready: f"{amount:,.0f}" if ready else "N/A"
-            give_team = trade.get("give_team", "Your team")
-            get_team = trade.get("get_team", "Other team")
-            updated = trade.get("updated_at") or trade.get("saved_at", "")
-            if "T" in updated:
-                updated = updated.replace("T", " ")
-            self.saved_trade_tree.insert(
-                "", "end", iid=str(trade["id"]),
-                text=f"{give_team}  ⇄  {get_team}",
-                values=(trade.get("outcome", "Proposed"),
-                        format_value(give_value, give_complete),
-                        format_value(receive_value, receive_complete),
-                        self._market_lean(give_value, receive_value, complete),
-                        trade.get("note", ""), updated),
-            )
+            opponent = trade.get("get_team", "Other team")
+            if opponent not in opponent_groups:
+                group_id = f"opponent-group-{len(opponent_groups)}"
+                opponent_groups[opponent] = group_id
+                self.saved_trade_tree.insert(
+                    "", "end", iid=group_id, text=f"{opponent}", open=True
+                )
+            self._insert_saved_trade_tree_item(trade, opponent_groups[opponent])
         if select_id and self.saved_trade_tree.exists(str(select_id)):
             self.saved_trade_tree.selection_set(str(select_id))
             self.saved_trade_tree.see(str(select_id))
@@ -2042,10 +3200,57 @@ class App(tk.Tk):
         else:
             self.saved_trade_details.set("Select a saved trade to see its players and note.")
 
+    def _insert_saved_trade_tree_item(self, trade, parent_iid):
+        #Show counteroffers as child rows under the original trade, grouped by opposing team above.
+        give_value, give_complete = self._saved_trade_side_value(trade.get("give_players", []))
+        receive_value, receive_complete = self._saved_trade_side_value(trade.get("get_players", []))
+        complete = give_complete and receive_complete
+        format_value = lambda amount, ready: f"{amount:,.0f}" if ready else "N/A"
+        give_team = trade.get("give_team", "Your team")
+        get_team = trade.get("get_team", "Other team")
+        updated = trade.get("updated_at") or trade.get("saved_at", "")
+        if "T" in updated:
+            updated = updated.replace("T", " ")
+        row_label = f"{give_team}  ⇄  {get_team}"
+        if trade.get("parent_trade_id"):
+            row_label = f"Counteroffer: {row_label}"
+        self.saved_trade_tree.insert(
+            parent_iid, "end", iid=str(trade["id"]),
+            text=row_label,
+            values=(trade.get("outcome", "Proposed"),
+                    format_value(give_value, give_complete),
+                    format_value(receive_value, receive_complete),
+                    self._market_lean(give_value, receive_value, complete),
+                    trade.get("note", ""), updated),
+            open=True,
+        )
+        for counteroffer in trade.get("counter_offers", []):
+            self._insert_saved_trade_tree_item(counteroffer, str(trade["id"]))
+
     def _find_saved_trade(self, trade_id):
-        #Find one saved proposal by its stable local ID.
-        return next((trade for trade in self._saved_trade_records()
-                     if str(trade.get("id")) == str(trade_id)), None)
+        #Find a top-level trade or any attached counteroffer by its stable local ID.
+        def find(records):
+            for trade in records:
+                if str(trade.get("id")) == str(trade_id):
+                    return trade
+                nested = find(trade.get("counter_offers", []))
+                if nested:
+                    return nested
+            return None
+        return find(self._saved_trade_records())
+
+    def _locate_saved_trade(self, trade_id, records=None, parent=None):
+        #Return the list that directly owns a saved trade so top-level and nested entries can be edited.
+        records = self._saved_trade_records() if records is None else records
+        for index, trade in enumerate(records):
+            if str(trade.get("id")) == str(trade_id):
+                return records, index, trade, parent
+            located = self._locate_saved_trade(
+                trade_id, trade.get("counter_offers", []), parent=trade
+            )
+            if located:
+                return located
+        return None
 
     def _mark_saved_trade_outcome(self, outcome):
         #Update the selected saved proposal's outcome without changing its players or note.
@@ -2074,6 +3279,8 @@ class App(tk.Tk):
             return
         trade = self._find_saved_trade(selection[0])
         if not trade:
+            self.copy_outcome_button.configure(state="disabled", text="Copy Proposed Text")
+            self.saved_trade_details.set("Select a trade under an opposing team to see its players and note.")
             return
         outcome = trade.get("outcome", "Proposed")
         self.copy_outcome_button.configure(state="normal", text=f"Copy {outcome} Text")
@@ -2090,6 +3297,7 @@ class App(tk.Tk):
         get_lines, get_total = describe("get_players")
         self.saved_trade_details.set(
             f"Outcome: {outcome}\n"
+            f"Attached counteroffers: {len(trade.get('counter_offers', []))}\n"
             f"Note: {trade.get('note') or '—'}\n\n"
             f"You give ({trade.get('give_team', 'Your team')}) — {give_total}\n{give_lines}\n\n"
             f"You receive ({trade.get('get_team', 'Other team')}) — {get_total}\n{get_lines}"
@@ -2107,7 +3315,15 @@ class App(tk.Tk):
             assets.append({"id": player_id, "name": tree.item(iid, "text"), "position": position})
         return assets
 
-    def _save_current_trade(self, outcome=None):
+    def _sync_save_as_new_trade_button(self):
+        #Only offer a duplicate action when Save Trade is updating an existing record.
+        if self.active_saved_trade_id:
+            if not self.save_as_new_trade_button.winfo_manager():
+                self.save_as_new_trade_button.pack(side="left", padx=8, before=self.new_trade_button)
+        else:
+            self.save_as_new_trade_button.pack_forget()
+
+    def _save_current_trade(self, outcome=None, save_as_new=False):
         #Save or update a trade while preserving its outcome unless the user changes it.
         if self.dataframes is None:
             messagebox.showwarning("No League Loaded", "Load a league before saving a trade.")
@@ -2118,11 +3334,20 @@ class App(tk.Tk):
             messagebox.showwarning("Incomplete Trade", "Select at least one player on both sides before saving.")
             return
         now = datetime.now().astimezone().isoformat(timespec="minutes")
-        record_id = self.active_saved_trade_id or uuid.uuid4().hex
-        existing_trade = self._find_saved_trade(record_id)
+        counter_parent = (
+            self._find_saved_trade(self.active_counteroffer_parent_id)
+            if self.active_counteroffer_parent_id and not save_as_new else None
+        )
+        if self.active_counteroffer_parent_id and not save_as_new and not counter_parent:
+            messagebox.showerror("Counteroffer Unavailable", "The saved trade this counteroffer belongs to could not be found.")
+            return
+        is_counteroffer = counter_parent is not None
+        record_id = uuid.uuid4().hex if save_as_new else (self.active_saved_trade_id or uuid.uuid4().hex)
+        located = self._locate_saved_trade(record_id) if not save_as_new else None
+        existing_trade = located[2] if located else None
         if outcome:
             saved_outcome = outcome
-        elif existing_trade and str(record_id) == str(self.active_saved_trade_id):
+        elif existing_trade and str(record_id) == str(self.active_saved_trade_id) and not save_as_new:
             saved_outcome = self._current_trade_outcome()
         else:
             saved_outcome = "Proposed"
@@ -2139,8 +3364,15 @@ class App(tk.Tk):
             "note": self.trade_note_var.get().strip(),
             "saved_at": now,
             "updated_at": now,
+            "counter_offers": existing_trade.get("counter_offers", []) if existing_trade else [],
         }
-        records = self.saved_trades.setdefault(record["league_id"], [])
+        if existing_trade:
+            record["saved_at"] = existing_trade.get("saved_at", now)
+        if is_counteroffer:
+            record["parent_trade_id"] = str(counter_parent["id"])
+            records = counter_parent.setdefault("counter_offers", [])
+        else:
+            records = self.saved_trades.setdefault(record["league_id"], [])
         existing = next((index for index, item in enumerate(records)
                          if str(item.get("id")) == str(record_id)), None)
         if existing is None:
@@ -2153,15 +3385,20 @@ class App(tk.Tk):
             messagebox.showerror("Could Not Save Trade", f"The trade could not be saved on this computer.\n\n{exc}")
             return
         self.active_saved_trade_id = record_id
-        self.save_trade_button.configure(text="Update Saved Trade")
+        self.active_counteroffer_parent_id = str(counter_parent["id"]) if is_counteroffer else None
+        self.save_trade_button.configure(text="Update Counteroffer" if is_counteroffer else "Update Saved Trade")
+        self._sync_save_as_new_trade_button()
         self._update_trade_review()
         self._refresh_saved_trades_view(select_id=record_id)
-        self.status(f"{saved_outcome} trade saved on this computer. Its values update when market values load.")
+        description = "counteroffer" if is_counteroffer else "trade"
+        self.status(f"{saved_outcome} {description} saved on this computer. Its values update when market values load.")
 
     def _new_trade(self):
         #Clear selections and notes so the next proposal starts independently.
         self.active_saved_trade_id = None
+        self.active_counteroffer_parent_id = None
         self.save_trade_button.configure(text="Save Trade")
+        self._sync_save_as_new_trade_button()
         self.trade_note_var.set("")
         for tree in (self.trade_left_tree, self.trade_right_tree):
             selection = tree.selection()
@@ -2169,7 +3406,7 @@ class App(tk.Tk):
                 tree.selection_remove(*selection)
         self._update_trade_review()
 
-    def _reopen_saved_trade(self):
+    def _reopen_saved_trade(self, as_counteroffer=False):
         #Restore saved teams and player selections in the live trade reviewer.
         selection = self.saved_trade_tree.selection()
         if not selection:
@@ -2177,6 +3414,7 @@ class App(tk.Tk):
             return
         trade = self._find_saved_trade(selection[0])
         if not trade:
+            messagebox.showinfo("Choose a Trade", "Select a saved trade row under an opposing team.")
             return
         left_index = next((i for i, (_label, roster_id) in enumerate(self.team_options)
                            if str(roster_id) == str(trade.get("give_roster_id"))), None)
@@ -2200,8 +3438,17 @@ class App(tk.Tk):
                     tree.see(iid)
                     found.add(str(tags[0]))
             missing.extend(wanted - found)
-        self.active_saved_trade_id = str(trade["id"])
-        self.save_trade_button.configure(text="Update Saved Trade")
+        if as_counteroffer:
+            self.active_saved_trade_id = None
+            self.active_counteroffer_parent_id = str(trade["id"])
+            self.save_trade_button.configure(text="Save Counteroffer")
+        else:
+            self.active_saved_trade_id = str(trade["id"])
+            self.active_counteroffer_parent_id = trade.get("parent_trade_id")
+            self.save_trade_button.configure(
+                text="Update Counteroffer" if self.active_counteroffer_parent_id else "Update Saved Trade"
+            )
+        self._sync_save_as_new_trade_button()
         self.workspace.select(self.trade_tab)
         self._update_trade_review()
         if missing:
@@ -2216,18 +3463,28 @@ class App(tk.Tk):
         trade = self._find_saved_trade(selection[0])
         if not trade or not messagebox.askyesno("Delete Saved Trade", "Delete this saved trade from this computer?"):
             return
-        records = self._saved_trade_records()
-        self.saved_trades[self._current_league_id()] = [
-            item for item in records if str(item.get("id")) != str(trade.get("id"))
-        ]
+        located = self._locate_saved_trade(trade.get("id"))
+        if not located:
+            return
+        records, index, _record, _parent = located
+        removed_ids = set()
+        def collect_ids(item):
+            removed_ids.add(str(item.get("id")))
+            for child in item.get("counter_offers", []):
+                collect_ids(child)
+        collect_ids(trade)
+        del records[index]
         try:
             self._persist_saved_trades()
         except OSError as exc:
             messagebox.showerror("Could Not Delete Trade", f"The saved trade could not be removed.\n\n{exc}")
             return
-        if self.active_saved_trade_id == str(trade.get("id")):
+        if (self.active_saved_trade_id in removed_ids or
+                self.active_counteroffer_parent_id in removed_ids):
             self.active_saved_trade_id = None
+            self.active_counteroffer_parent_id = None
             self.save_trade_button.configure(text="Save Trade")
+            self._sync_save_as_new_trade_button()
         self._refresh_saved_trades_view()
 
     def _format_changed(self, _event=None):
@@ -2481,7 +3738,7 @@ class App(tk.Tk):
 
         self.run_background(task, loaded)
 
-    def _build_history_window_control(self, parent):
+    def _build_history_window_control(self, parent, metric=False, action=None):
         #Offer the same time scale in each player-history panel.
         controls = ttk.Frame(parent)
         controls.pack(fill="x", anchor="w", pady=(0, 4))
@@ -2492,13 +3749,94 @@ class App(tk.Tk):
         )
         selector.pack(side="left", padx=(7, 0))
         selector.bind("<<ComboboxSelected>>", self._history_window_changed)
+        if metric:
+            ttk.Label(controls, text="Metric:").pack(side="left", padx=(14, 0))
+            metric_selector = ttk.Combobox(
+                controls, textvariable=self.trade_history_metric_var,
+                values=("Percent Change", "Value"), state="readonly", width=16,
+            )
+            metric_selector.pack(side="left", padx=(7, 0))
+            metric_selector.bind("<<ComboboxSelected>>", self._trade_history_metric_changed)
+        if action is not None:
+            ttk.Button(controls, text="Open Graph", command=action).pack(side="right")
         return selector
+
+    def _refresh_player_history_source(self, source):
+        #Reload the selected player associated with a graph window.
+        if source == "trends":
+            self._select_value_trend_player()
+        elif source == "roster":
+            self._select_roster_history()
+        elif source == "weekly":
+            self._select_weekly_history()
+
+    def _open_player_history_graph(self, source):
+        #Open one of the compact player history graphs in a larger window.
+        details = {
+            "roster": ("roster_history_canvas", "roster_history_points", self.roster_history_detail,
+                       "Roster Player Value History", "Select a player to load a 90-day value trend."),
+            "weekly": ("weekly_history_canvas", "weekly_history_points", self.weekly_history_detail,
+                       "Weekly Help Player Value History", "Select a player to load a 90-day value trend."),
+            "trends": ("value_history_canvas", "value_history_points", self.value_trend_detail,
+                       "Player Value History", "Select a player to load a 90-day trend chart."),
+        }
+        if source not in details:
+            return
+        if self.player_history_window and self.player_history_window.winfo_exists():
+            if self.player_history_popup_source == source:
+                self.player_history_window.deiconify()
+                self.player_history_window.lift()
+                self.player_history_window.focus_force()
+                return
+            self._close_player_history_window()
+        _canvas_name, points_name, detail, title, empty_text = details[source]
+        window = tk.Toplevel(self)
+        window.title(title)
+        width = min(1600, max(900, int(self.winfo_screenwidth() * 0.78)))
+        height = min(1000, max(560, int(self.winfo_screenheight() * 0.72)))
+        window.geometry(f"{width}x{height}")
+        window.minsize(720, 420)
+        self.player_history_window = window
+        self.player_history_popup_source = source
+        self.player_history_popup_points_name = points_name
+        self.player_history_popup_empty_text = empty_text
+        toolbar = ttk.Frame(window, padding=(12, 10, 12, 4))
+        toolbar.pack(fill="x")
+        self.player_history_popup_scale = self._build_history_window_control(toolbar)
+        ttk.Label(window, textvariable=detail, wraplength=1500, justify="left").pack(
+            anchor="w", padx=12, pady=(0, 4)
+        )
+        canvas = tk.Canvas(window, height=400, highlightthickness=0,
+                           bg=self.theme_colors["surface"],
+                           highlightbackground=self.theme_colors["border"])
+        canvas.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        canvas.bind("<Configure>", lambda _event, target=canvas, name=points_name, text=empty_text:
+                    self._render_history_chart(target, getattr(self, name, []), text))
+        self.player_history_popup_canvas = canvas
+        window.protocol("WM_DELETE_WINDOW", self._close_player_history_window)
+        self._render_history_chart(canvas, getattr(self, points_name, []), empty_text)
+
+    def _close_player_history_window(self):
+        #Release popup state so the next graph button opens the requested view.
+        if self.player_history_window and self.player_history_window.winfo_exists():
+            self.player_history_window.destroy()
+        self.player_history_window = None
+        self.player_history_popup_canvas = None
+        self.player_history_popup_source = None
+        self.player_history_popup_points_name = None
+        self.player_history_popup_empty_text = None
+        self.player_history_popup_scale = None
 
     def _history_window_limit(self):
         #Translate the visible range label into the number of daily snapshots to request.
         return VALUE_HISTORY_WINDOWS.get(self.value_history_window_var.get(), 91)
 
-    def _history_window_changed(self, _event=None):
+    def _history_window_changed(self, event=None):
+        #A popup's time scale always updates the graph it opened, even after tab changes.
+        if (event is not None and self.player_history_popup_scale is event.widget
+                and self.player_history_window and self.player_history_window.winfo_exists()):
+            self._refresh_player_history_source(self.player_history_popup_source)
+            return
         #Reload only the selected player on the active tab with the new history range.
         selected_tab = self.workspace.tab(self.workspace.select(), "text")
         if selected_tab == "Value Trends":
@@ -2508,6 +3846,8 @@ class App(tk.Tk):
         elif selected_tab == "Weekly Help":
             self._select_weekly_history()
         elif selected_tab == "Trade Review":
+            self._refresh_trade_history(self.trade_left_tree.selection(), self.trade_right_tree.selection())
+        elif self.trade_history_popup_canvas and self.trade_history_popup_canvas.winfo_exists():
             self._refresh_trade_history(self.trade_left_tree.selection(), self.trade_right_tree.selection())
 
     @staticmethod
@@ -2618,12 +3958,67 @@ class App(tk.Tk):
 
         self.run_background(task, loaded)
 
-    def _draw_trade_history(self):
-        #Overlay selected players as indexed percentage changes on a common axis.
-        if not hasattr(self, "trade_history_canvas"):
+    def _open_trade_history_window(self):
+        #Show the selected trade histories in a larger resizable window.
+        if self.trade_history_window and self.trade_history_window.winfo_exists():
+            self.trade_history_window.deiconify()
+            self.trade_history_window.lift()
+            self.trade_history_window.focus_force()
             return
-        canvas = self.trade_history_canvas
+        window = tk.Toplevel(self)
+        window.title("Selected Players' Value Trends")
+        width = min(1600, max(900, int(self.winfo_screenwidth() * 0.78)))
+        height = min(1000, max(560, int(self.winfo_screenheight() * 0.72)))
+        window.geometry(f"{width}x{height}")
+        window.minsize(720, 420)
+        self.trade_history_window = window
+        toolbar = ttk.Frame(window, padding=(12, 10, 12, 4))
+        toolbar.pack(fill="x")
+        self._build_history_window_control(toolbar, metric=True)
+        ttk.Label(window, textvariable=self.trade_history_status, wraplength=1500,
+                  justify="left").pack(anchor="w", padx=12, pady=(0, 4))
+        canvas = tk.Canvas(
+            window, height=400, highlightthickness=0,
+            bg=self.theme_colors["surface"], highlightbackground=self.theme_colors["border"],
+        )
+        canvas.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        canvas.bind("<Configure>", lambda _event, target=canvas: self._draw_trade_history(target))
+        canvas.bind("<Motion>", lambda event, target=canvas: self._show_trade_history_hover(event, target))
+        canvas.bind("<Leave>", lambda _event, target=canvas: self._clear_trade_history_hover(target))
+        self.trade_history_popup_canvas = canvas
+        window.protocol("WM_DELETE_WINDOW", self._close_trade_history_window)
+        self._draw_trade_history(canvas)
+
+    def _close_trade_history_window(self):
+        #Release the popup references so reopening creates a fresh graph window.
+        if self.trade_history_window and self.trade_history_window.winfo_exists():
+            self.trade_history_window.destroy()
+        self.trade_history_window = None
+        self.trade_history_popup_canvas = None
+
+    def _draw_trade_history(self, target_canvas=None):
+        #Overlay selected players as indexed percentage changes on a common axis.
+        if target_canvas is None and not hasattr(self, "trade_history_canvas"):
+            return
+        canvases = (
+            [target_canvas] if target_canvas is not None else
+            [self.trade_history_canvas] + (
+                [self.trade_history_popup_canvas]
+                if self.trade_history_popup_canvas and self.trade_history_popup_canvas.winfo_exists() else []
+            )
+        )
+        for canvas in canvases:
+            self.trade_history_plot_points[str(canvas)] = []
+            self._draw_trade_history_canvas(canvas)
+
+    def _trade_history_metric_changed(self, _event=None):
+        #Switch axes locally without reloading the selected player histories.
+        self._draw_trade_history()
+
+    def _draw_trade_history_canvas(self, canvas):
+        #Render one canvas so inline and popup graphs always use the same selected data.
         canvas.delete("all")
+        canvas.configure(bg=self.theme_colors["surface"], highlightbackground=self.theme_colors["border"])
         series = [item for item in self.trade_history_series if item.get("points")]
         if not series:
             canvas.create_text(12, 18, anchor="nw", text="Select players in Trade Review to compare their histories.",
@@ -2638,6 +4033,7 @@ class App(tk.Tk):
         )
         width = max(canvas.winfo_width(), 420)
         height = max(canvas.winfo_height(), 120)
+        percent_mode = self.trade_history_metric_var.get() == "Percent Change"
         legend_x, legend_y = 12, 10
         for index, item in enumerate(series):
             color = colors[index % len(colors)]
@@ -2657,7 +4053,10 @@ class App(tk.Tk):
         for item in series:
             first_value = item["points"][0][1]
             if first_value:
-                movements.extend((value / first_value - 1) * 100 for _date, value in item["points"])
+                if percent_mode:
+                    movements.extend((value / first_value - 1) * 100 for _date, value in item["points"])
+                else:
+                    movements.extend(value for _date, value in item["points"])
         if not movements:
             canvas.create_text(12, top, anchor="nw", text="No comparable value history is available.",
                                fill=self.theme_colors["muted"])
@@ -2670,8 +4069,10 @@ class App(tk.Tk):
             y = bottom - fraction * (bottom - top)
             label = minimum + fraction * spread
             canvas.create_line(left, y, right, y, fill=self.theme_colors["border"], dash=(2, 3))
-            canvas.create_text(2, y, anchor="w", text=f"{label:+.1f}%",
+            axis_label = f"{label:+.1f}%" if percent_mode else f"{label:,.0f}"
+            canvas.create_text(2, y, anchor="w", text=axis_label,
                                fill=self.theme_colors["muted"], font=("TkDefaultFont", 8))
+        hover_points = []
         for index, item in enumerate(series):
             points = item["points"]
             first_value = points[0][1]
@@ -2680,9 +4081,14 @@ class App(tk.Tk):
             coords = []
             for point_index, (_date, value) in enumerate(points):
                 x = left if len(points) == 1 else left + point_index * (right - left) / (len(points) - 1)
-                movement = (value / first_value - 1) * 100
-                y = bottom - (movement - minimum) / spread * (bottom - top)
+                change_pct = (value / first_value - 1) * 100
+                graph_value = change_pct if percent_mode else value
+                y = bottom - (graph_value - minimum) / spread * (bottom - top)
                 coords.extend((x, y))
+                hover_points.append({
+                    "x": x, "y": y, "date": _date, "value": value,
+                    "change_pct": change_pct, "name": item["name"], "side": item["side"],
+                })
             if len(coords) >= 4:
                 canvas.create_line(*coords, fill=colors[index % len(colors)], width=2, smooth=True,
                                    dash=(5, 3) if item["side"] == "Receive" else ())
@@ -2695,6 +4101,40 @@ class App(tk.Tk):
             canvas.create_line(x, top, x, bottom, fill=self.theme_colors["border"], dash=(1, 4))
             canvas.create_text(x, height - 2, anchor="s", text=reference[index][0][5:],
                                fill=self.theme_colors["muted"], font=("TkDefaultFont", 7))
+        self.trade_history_plot_points[str(canvas)] = hover_points
+
+    def _show_trade_history_hover(self, event, canvas):
+        #Show the closest snapshot's date, raw value, and indexed movement.
+        points = self.trade_history_plot_points.get(str(canvas), [])
+        if not points:
+            self._clear_trade_history_hover(canvas)
+            return
+        point = min(points, key=lambda item: (item["x"] - event.x) ** 2 + (item["y"] - event.y) ** 2)
+        if (point["x"] - event.x) ** 2 + (point["y"] - event.y) ** 2 > 14 ** 2:
+            self._clear_trade_history_hover(canvas)
+            return
+        self._clear_trade_history_hover(canvas)
+        if self.trade_history_metric_var.get() == "Percent Change":
+            detail = f"{point['change_pct']:+.1f}% from start · value {point['value']:,.0f}"
+        else:
+            detail = f"value {point['value']:,.0f} · {point['change_pct']:+.1f}% from start"
+        text = f"{point['side']}: {point['name']}\n{point['date']} · {detail}"
+        x = min(max(event.x + 14, 4), max(4, canvas.winfo_width() - 280))
+        y = min(max(event.y + 14, 4), max(4, canvas.winfo_height() - 48))
+        background = "#292f36" if self.dark_mode_var.get() else "#ffffff"
+        foreground = "#edf1f5" if self.dark_mode_var.get() else "#20252b"
+        border = self.theme_colors["border"]
+        canvas.create_rectangle(x, y, x + 276, y + 44, fill=background, outline=border,
+                                tags=("trade-history-hover",))
+        canvas.create_text(x + 6, y + 5, anchor="nw", text=text, width=264,
+                           fill=foreground, font=("TkDefaultFont", 8),
+                           tags=("trade-history-hover",))
+
+    @staticmethod
+    def _clear_trade_history_hover(canvas):
+        #Remove the transient detail callout when the pointer moves away from a data point.
+        if canvas.winfo_exists():
+            canvas.delete("trade-history-hover")
 
     def _render_value_history(self, player_id, value_format, history_payload,
                               canvas=None, detail_var=None, points_name="value_history_points"):
@@ -2748,8 +4188,24 @@ class App(tk.Tk):
         )
 
     def _draw_history_chart(self, canvas, points, empty_text):
+        #Keep an open pop-out synchronized with redraws of its compact source graph.
+        self._render_history_chart(canvas, points, empty_text)
+        source_canvas = {
+            "roster": getattr(self, "roster_history_canvas", None),
+            "weekly": getattr(self, "weekly_history_canvas", None),
+            "trends": getattr(self, "value_history_canvas", None),
+        }.get(self.player_history_popup_source)
+        popup = self.player_history_popup_canvas
+        if popup and popup.winfo_exists() and canvas is source_canvas:
+            self._render_history_chart(
+                popup, getattr(self, self.player_history_popup_points_name, []),
+                self.player_history_popup_empty_text,
+            )
+
+    def _render_history_chart(self, canvas, points, empty_text):
         #Render a compact shared chart with date ticks sized to the visible width.
         canvas.delete("all")
+        canvas.configure(bg=self.theme_colors["surface"], highlightbackground=self.theme_colors["border"])
         if not points:
             canvas.create_text(
                 12, 18, anchor="nw", text=empty_text,
@@ -2844,6 +4300,7 @@ class App(tk.Tk):
             (self.weekly_state, self.weekly_matchups, self.weekly_bye_weeks,
              self.weekly_context_error, self.weekly_schedule_error) = result
             self._refresh_weekly_help()
+            self._refresh_trade_bye_weeks()
             self._load_roster_projections()
 
         self.run_background(task, loaded)
@@ -3087,22 +4544,56 @@ class App(tk.Tk):
                 rows = self.api.get_fantasycalc_values(params)
                 values = {}
                 trends = {}
+                player_positions = {}
                 for entry in rows:
                     player = entry.get("player") or {}
                     sleeper_id = player.get("sleeperId")
                     if sleeper_id not in (None, "") and entry.get("value") is not None:
                         player_id = str(sleeper_id)
                         values[player_id] = float(entry["value"])
+                        raw_positions = player.get("fantasyPositions") or player.get("position") or []
+                        if isinstance(raw_positions, str):
+                            raw_positions = raw_positions.replace("/", ",").split(",")
+                        elif not isinstance(raw_positions, (list, tuple, set)):
+                            raw_positions = [raw_positions]
+                        player_positions[player_id] = tuple(
+                            str(position).strip().upper() for position in raw_positions if str(position).strip()
+                        )
                         if entry.get("trend30Day") is not None:
                             trends[player_id] = float(entry["trend30Day"])
-                return values, trends, None
+                overall_ranks = {}
+                sorted_players = sorted(values.items(), key=lambda item: (-item[1], item[0]))
+                previous_value = None
+                for index, (player_id, value) in enumerate(sorted_players, start=1):
+                    if value != previous_value:
+                        current_rank = index
+                    overall_ranks[player_id] = current_rank
+                    previous_value = value
+                by_position = {}
+                for player_id, positions in player_positions.items():
+                    for position in positions:
+                        by_position.setdefault(position, []).append(player_id)
+                position_ranks = {}
+                for position, player_ids in by_position.items():
+                    previous_value = None
+                    sorted_ids = sorted(player_ids, key=lambda item: (-values[item], item))
+                    for index, player_id in enumerate(sorted_ids, start=1):
+                        value = values[player_id]
+                        if value != previous_value:
+                            current_rank = index
+                        position_ranks.setdefault(player_id, {})[position] = current_rank
+                        previous_value = value
+                return values, trends, overall_ranks, position_ranks, None
             except Exception as exc:
-                return {}, {}, str(exc)
+                return {}, {}, {}, {}, str(exc)
 
         def loaded(result):
-            values, trends, error = result
+            values, trends, overall_ranks, position_ranks, error = result
             self.fantasycalc_values = values
             self.fantasycalc_trends = trends
+            self.fantasycalc_overall_ranks = overall_ranks
+            self.fantasycalc_position_ranks = position_ranks
+            self._refresh_trade_builder_values()
             self._populate_trade_rosters()
             self._refresh_saved_trades_view()
             self._refresh_trade_ideas()
@@ -3177,6 +4668,7 @@ class App(tk.Tk):
         if not self.leagues:
             self.league_combo["values"] = []
             self.league_var.set("")
+            self._update_window_context()
             self.status("No leagues were found for that user and season.")
             messagebox.showinfo(
                 "No Leagues",
@@ -3191,6 +4683,7 @@ class App(tk.Tk):
 
         self.league_combo["values"] = values
         self.league_combo.current(0)
+        self._update_window_context()
 
         if self.startup_autoload_pending:
             self.startup_autoload_pending = False
@@ -3226,9 +4719,11 @@ class App(tk.Tk):
         #Remember the selected league ID so the app can reopen it on the next launch.
         league = self.selected_league()
         if not league:
+            self._update_window_context()
             return
         self.saved_settings["league_id"] = str(league.get("league_id", ""))
         self._save_settings()
+        self._update_window_context()
 
     def load_selected_league(self):
         #Save the current choices and fetch league, roster, and player data in the background.
@@ -3243,6 +4738,7 @@ class App(tk.Tk):
         self.saved_settings["username"] = self.username_var.get().strip()
         self.saved_settings["season"] = self.season_var.get().strip()
         self._save_settings()
+        self._update_window_context()
 
         def task():
             return build_data(
@@ -3256,8 +4752,12 @@ class App(tk.Tk):
     def _league_loaded(self, dataframes):
         #Enable analysis tools, choose the logged-in user's team, and refresh market data.
         self.dataframes = dataframes
+        self.loaded_username = self.username_var.get().strip()
+        self._update_window_context()
         self.fantasycalc_values = {}
         self.fantasycalc_trends = {}
+        self.fantasycalc_overall_ranks = {}
+        self.fantasycalc_position_ranks = {}
         self._new_trade()
         self.export_button.configure(state="normal")
 
@@ -3273,6 +4773,7 @@ class App(tk.Tk):
         self.weekly_team_combo["values"] = options
         self.roster_team_combo["values"] = options
         self.value_trend_team_combo["values"] = ["All League Players"] + options
+        self.trade_builder_team_combo["values"] = options
         self.trade_left_team["values"] = options
         self.trade_right_team["values"] = options
         own_roster_id = None
@@ -3288,6 +4789,7 @@ class App(tk.Tk):
             self.weekly_team_combo.current(default_index)
             self.roster_team_combo.current(default_index)
             self.value_trend_team_combo.current(0)
+            self.trade_builder_team_combo.current(default_index)
             self.trade_left_team.current(default_index)
             other_index = 1 if len(options) > 1 and default_index == 0 else 0
             self.trade_right_team.current(other_index)
@@ -3310,8 +4812,10 @@ class App(tk.Tk):
         self._refresh_roster_view()
         self._refresh_value_trends()
         self._refresh_trade_ideas()
+        self._trade_builder_team_changed()
         self._populate_trade_rosters()
         self._refresh_saved_trades_view()
+        self.workspace.select(self.position_needs_tab)
 
         league_df = dataframes["League Info"]
         league_name = league_df.iloc[0]["League Name"]

@@ -65,6 +65,9 @@ $specPath = Join-Path $outputRoot "spec"
     --clean `
     --onefile `
     --windowed `
+    --icon (Join-Path $projectRoot "app_icon.ico") `
+    --add-data "$(Join-Path $projectRoot 'app_icon.ico');." `
+    --add-data "$(Join-Path $projectRoot 'install_update.ps1');." `
     --hidden-import=tkinter `
     --hidden-import=tkinter.ttk `
     --hidden-import=tkinter.filedialog `

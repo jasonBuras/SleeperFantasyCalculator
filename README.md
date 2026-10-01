@@ -13,14 +13,18 @@ The app uses Sleeper's public read-only API and does not need your Sleeper passw
 
 The executable includes Python, the app, and its required libraries. You do not need to install Python, open a terminal, or install dependencies to use it. Windows may show a security prompt because the app is not code-signed; only run an executable from someone you trust.
 
+The app uses `app_icon.ico` for its window icon, and the Windows build embeds that icon in the executable.
+
 ## App features
 
+- **Main Menu** is where you select a Sleeper username, season, and league. The active username and league stay visible in the app header as you move between tabs.
+- **Software Updates** checks the latest stable GitHub Release and displays its release notes. In the packaged Windows app, choose **Download and Install** to verify and apply the update; the app asks before closing and reopens when the update finishes.
 - **Position Needs** compares teams' roster depth with their league lineup requirements. It is a roster-count overview, not a player projection.
 - **Roster View** shows a team's players grouped by their Sleeper lineup slot, including starters, bench, and IR/reserve. Select a player to view available value history and roster details.
 - **Weekly Help** brings together matchup context, bye-week coverage, available free agents, and weekly projections when Sleeper provides them. FantasyCalc market values are not weekly point projections.
 - **Value Trends** compares FantasyCalc and Stats Guy Fantasy values, shows which team rostered each player (or whether the player is a free agent), and graphs historical value movement. Select the history window and players to compare trends where data is available.
-- **Trade Review** lets you choose players from two teams, compare totals from both value sources, inspect roster-depth impact, and copy a trade proposal. The player list can be sorted by last name, position priority (QB, RB, WR, TE, K), status, NFL team, or value.
-- **Saved Trades** stores proposals, accepted trades, and rejected trades on this computer. Reopen a saved trade to review or edit it; the displayed totals use currently loaded market values.
+- **Trade Review** lets you choose players from two teams, compare totals from both value sources, inspect roster-depth impact, preview copied trade text, and copy a trade proposal. The page scrolls on shorter displays. Open the player trend graph in a separate window and switch between percent change and raw value; hover over a point for its date and exact values. The player list can be sorted by last name, position priority (QB, RB, WR, TE, K), status, NFL team, or value.
+- **Saved Trades** stores proposals, accepted trades, and rejected trades on this computer, grouped by opposing team. Reopen a saved trade to edit it, save it as a new trade, or attach counteroffers; the displayed totals use currently loaded market values.
 - **Trade Targets** suggests possible one-for-one trade ideas based on roster fit and market values. Treat suggestions as starting points to adjust, not automatic recommendations.
 - **Export to Excel** creates a workbook with one sheet per team, named after the team in Sleeper. Each roster is ordered with starters first in lineup order, then bench, then IR/reserve. The columns are Position, Player, NFL Team, Status, Injury Status, and Slot. After saving, the app asks whether you want to open the workbook.
 - **Dark mode** lets you switch the app's appearance.
@@ -46,5 +50,3 @@ Building the executable is intended for the person preparing a release; league m
    ```
 
 The build script creates an isolated `.build-venv`, installs the packages listed in `requirements.txt` and PyInstaller, then writes `build\dist\FantasyTradeCalculator.exe`. It does not change your system Python packages. The generated build files are excluded from Git.
-
-To run the app directly from source, install the packages in `requirements.txt` in a Python environment that includes Tcl/Tk, then run `python sleeper_exporter.py`.
