@@ -27,7 +27,7 @@ from openpyxl.utils import get_column_letter
 
 #This URL is the root used by Sleeper's read-only API.
 BASE_URL = "https://api.sleeper.app/v1"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 GITHUB_RELEASE_API = "https://api.github.com/repos/jasonBuras/SleeperFantasyCalculator/releases/latest"
 UPDATE_ASSET_NAME = "FantasyTradeCalculator-Windows.zip"
 
@@ -1727,6 +1727,9 @@ class App(tk.Tk):
         self.trade_builder_package_size_filter.set("Any")
         self.trade_builder_package_size_filter.pack(side="left", padx=(4, 0))
         self.trade_builder_package_size_filter.bind("<<ComboboxSelected>>", self._filter_trade_builder_matches)
+        ttk.Button(
+            return_filters, text="Reset Filters", command=self._reset_trade_builder_filters,
+        ).pack(side="left", padx=(10, 0))
         self.trade_builder_results_tree = ttk.Treeview(
             return_box, columns=("players", "positions", "value", "difference", "fit"),
             show="tree headings", selectmode="browse", height=10,
@@ -2785,6 +2788,12 @@ class App(tk.Tk):
             self.trade_builder_summary.set(
                 f"No return packages within {tolerance:.0%} of {give_value:,.0f}. Try a wider value gap."
             )
+
+    def _reset_trade_builder_filters(self):
+        #Restore both builder filters and display every available match.
+        self.trade_builder_position_filter.set("Any")
+        self.trade_builder_package_size_filter.set("Any")
+        self._filter_trade_builder_matches()
 
     def _open_trade_builder_match(self):
         #Load the selected package into Trade Review so it can be edited and assessed.
