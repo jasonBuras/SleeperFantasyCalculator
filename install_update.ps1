@@ -59,7 +59,21 @@ try {
     Move-Item -LiteralPath $executable -Destination $backupPath
     try {
         Move-Item -LiteralPath $replacementPath -Destination $executable
-        Start-Process -FilePath $executable
+        #Launch the replacement as a fresh one-file PyInstaller instance instead of reusing
+        #the old app's temporary extraction directory, which is removed as that app exits.
+        $previousResetEnvironment = $env:PYINSTALLER_RESET_ENVIRONMENT
+        try {
+            $env:PYINSTALLER_RESET_ENVIRONMENT = "1"
+            Start-Process -FilePath $executable -WorkingDirectory ([System.IO.Path]::GetDirectoryName($executable))
+        }
+        finally {
+            if ($null -eq $previousResetEnvironment) {
+                Remove-Item Env:PYINSTALLER_RESET_ENVIRONMENT -ErrorAction SilentlyContinue
+            }
+            else {
+                $env:PYINSTALLER_RESET_ENVIRONMENT = $previousResetEnvironment
+            }
+        }
     }
     catch {
         if (Test-Path -LiteralPath $executable -PathType Leaf) {

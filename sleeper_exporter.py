@@ -27,7 +27,7 @@ from openpyxl.utils import get_column_letter
 
 #This URL is the root used by Sleeper's read-only API.
 BASE_URL = "https://api.sleeper.app/v1"
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 GITHUB_RELEASE_API = "https://api.github.com/repos/jasonBuras/SleeperFantasyCalculator/releases/latest"
 UPDATE_ASSET_NAME = "FantasyTradeCalculator-Windows.zip"
 
@@ -695,6 +695,8 @@ class App(tk.Tk):
         self.status_var = tk.StringVar(value="Enter a Sleeper username and load leagues.")
         self.update_status_var = tk.StringVar(value=f"Installed version {APP_VERSION}. Check for updates when you're ready.")
         self.update_notes_var = tk.StringVar(value="Release notes will appear here after checking for updates.")
+        self.update_release_url_var = tk.StringVar(value="")
+        self.update_release_link_text_var = tk.StringVar(value="")
         self.available_update = None
         self.copy_trade_preview_var = tk.StringVar(
             value="Select at least one player from each team to preview the copied text."
@@ -843,6 +845,12 @@ class App(tk.Tk):
             self._draw_trade_history()
         if hasattr(self, "trade_tab_canvas"):
             self.trade_tab_canvas.configure(bg=bg)
+        if hasattr(self, "update_notes_text"):
+            self.update_notes_text.configure(
+                background=surface, foreground=fg, insertbackground=fg,
+            )
+        if hasattr(self, "update_release_link"):
+            self.update_release_link.configure(foreground=accent)
 
     def _toggle_dark_mode(self):
         #Apply the chosen palette and save it for the next launch.
@@ -897,8 +905,34 @@ class App(tk.Tk):
         self.update_install_button.configure(state="disabled")
         self.available_update = None
         self.update_status_var.set("Checking GitHub for the latest release…")
-        self.update_notes_var.set("")
+        self.update_release_url_var.set("")
+        self.update_release_link_text_var.set("")
+        self._set_update_notes("")
         self.run_background(self._fetch_latest_app_release_safely, self._show_app_update_result)
+
+    def _set_update_notes(self, notes):
+        #Show release notes as selectable plain text so users can copy them.
+        if not hasattr(self, "update_notes_text"):
+            self.update_notes_var.set(str(notes or ""))
+            return
+        self.update_notes_text.configure(state="normal")
+        self.update_notes_text.delete("1.0", "end")
+        self.update_notes_text.insert("1.0", str(notes or ""))
+        self.update_notes_text.configure(state="disabled")
+
+    def _copy_update_notes(self):
+        #Copy the complete plain-text release notes to the clipboard.
+        notes = self.update_notes_text.get("1.0", "end-1c")
+        if notes.strip():
+            self.clipboard_clear()
+            self.clipboard_append(notes)
+
+    def _open_update_release_page(self, _event=None):
+        #Only open release links hosted in this project's GitHub Releases page.
+        url = self.update_release_url_var.get().strip()
+        prefix = "https://github.com/jasonBuras/SleeperFantasyCalculator/releases/"
+        if url.startswith(prefix):
+            __import__("webbrowser").open(url)
 
     def _fetch_latest_app_release_safely(self):
         #Return network errors to the update panel without leaving its controls disabled.
@@ -912,13 +946,24 @@ class App(tk.Tk):
         self.update_check_button.configure(state="normal")
         if result.get("error"):
             self.update_status_var.set("Could not check for updates.")
-            self.update_notes_var.set(result["error"])
+            self.update_release_url_var.set("")
+            self.update_release_link_text_var.set("")
+            self._set_update_notes(result["error"])
             return
         if result.get("not_published"):
             self.update_status_var.set(f"Installed version {APP_VERSION} · No release has been published yet.")
-            self.update_notes_var.set("When a new version is released, its changes will appear here.")
+            self.update_release_url_var.set("")
+            self.update_release_link_text_var.set("")
+            self._set_update_notes("When a new version is released, its changes will appear here.")
             return
-        self.update_notes_var.set(result["notes"])
+        release_url = result.get("release_url", "")
+        self.update_release_url_var.set(release_url)
+        self.update_release_link_text_var.set(
+            "Open release notes on GitHub"
+            if release_url.startswith("https://github.com/jasonBuras/SleeperFantasyCalculator/releases/")
+            else ""
+        )
+        self._set_update_notes(result["notes"])
         try:
             current_version = self._app_version_key(APP_VERSION)
         except ValueError as exc:
@@ -1150,9 +1195,26 @@ class App(tk.Tk):
         )
         self.update_install_button.pack(side="left", padx=(8, 10))
         ttk.Label(update_actions, textvariable=self.update_status_var).pack(side="left", fill="x", expand=True)
-        ttk.Label(
-            updates, textvariable=self.update_notes_var, wraplength=1050, justify="left",
-        ).pack(anchor="w", fill="x", pady=(7, 0))
+        self.update_release_link = ttk.Label(
+            updates, textvariable=self.update_release_link_text_var, cursor="hand2",
+            foreground=self.theme_colors["accent"], underline=True,
+        )
+        self.update_release_link.pack(anchor="w", pady=(7, 3))
+        self.update_release_link.bind("<Button-1>", self._open_update_release_page)
+        ttk.Label(updates, text="Release notes (plain text):").pack(anchor="w")
+        notes_frame = ttk.Frame(updates)
+        notes_frame.pack(fill="x", pady=(3, 0))
+        self.update_notes_text = tk.Text(
+            notes_frame, height=6, wrap="word", state="disabled",
+            background=self.theme_colors["surface"], foreground=self.theme_colors["foreground"],
+            insertbackground=self.theme_colors["foreground"], relief="solid", borderwidth=1,
+        )
+        notes_scroll = ttk.Scrollbar(notes_frame, orient="vertical", command=self.update_notes_text.yview)
+        self.update_notes_text.configure(yscrollcommand=notes_scroll.set)
+        self.update_notes_text.pack(side="left", fill="both", expand=True)
+        notes_scroll.pack(side="right", fill="y")
+        ttk.Button(notes_frame, text="Copy Notes", command=self._copy_update_notes).pack(side="right", padx=(6, 0))
+        self._set_update_notes(self.update_notes_var.get())
 
         #Position Needs compares one team's roster counts with the league lineup slots.
         needs_tab = ttk.Frame(self.workspace, padding=12)
@@ -1456,14 +1518,18 @@ class App(tk.Tk):
         self.market_settings_var = tk.StringVar(value="Load a league to set market-value settings.")
         ttk.Label(format_row, textvariable=self.market_settings_var).pack(side="left")
 
-        sides = ttk.Frame(trade_tab)
-        sides.pack(fill="both", expand=True)
-        sides.columnconfigure(0, weight=1)
-        sides.columnconfigure(1, weight=1)
+        self.trade_review_split = ttk.PanedWindow(trade_tab, orient="vertical")
+        self.trade_review_split.pack(fill="x", pady=(0, 2))
+        sides = ttk.PanedWindow(self.trade_review_split, orient="horizontal")
         left = ttk.LabelFrame(sides, text="You give", padding=8)
         right = ttk.LabelFrame(sides, text="You receive", padding=8)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        sides.add(left, weight=1)
+        sides.add(right, weight=1)
+        self.trade_review_split.add(sides, weight=3)
+        trade_details = ttk.Frame(self.trade_review_split)
+        self.trade_review_details = trade_details
+        self.trade_review_split.add(trade_details, weight=2)
+        self.trade_review_split.bind("<ButtonRelease-1>", self._resize_trade_review_split, add="+")
         left_team_row = ttk.Frame(left)
         right_team_row = ttk.Frame(right)
         left_team_row.pack(fill="x", pady=(0, 7))
@@ -1494,11 +1560,11 @@ class App(tk.Tk):
         ttk.Label(right, text="Hold Ctrl to select multiple players.").pack(anchor="w", pady=(5, 0))
         self.trade_left_tree.bind("<<TreeviewSelect>>", self._update_trade_review)
         self.trade_right_tree.bind("<<TreeviewSelect>>", self._update_trade_review)
-        copy_preview = ttk.LabelFrame(trade_tab, text="Trade Overview", padding=5)
+        copy_preview = ttk.LabelFrame(trade_details, text="Trade Overview", padding=5)
         copy_preview.pack(fill="x", pady=(5, 0))
         ttk.Label(copy_preview, textvariable=self.copy_trade_preview_var,
                   wraplength=1300, justify="left").pack(anchor="w")
-        trade_actions = ttk.Frame(trade_tab)
+        trade_actions = ttk.Frame(trade_details)
         trade_actions.pack(fill="x", pady=(5, 0))
         self.save_trade_button = ttk.Button(trade_actions, text="Save Trade", command=self._save_current_trade)
         self.save_trade_button.pack(side="left")
@@ -1512,14 +1578,14 @@ class App(tk.Tk):
             trade_actions, text="Copy Trade Overview Text", command=self._copy_trade_text, state="disabled"
         )
         self.copy_trade_button.pack(side="left")
-        note_row = ttk.Frame(trade_tab)
+        note_row = ttk.Frame(trade_details)
         note_row.pack(fill="x", pady=(4, 0))
         ttk.Label(note_row, text="Note:").pack(side="left")
         self.trade_note_var = tk.StringVar()
         ttk.Entry(note_row, textvariable=self.trade_note_var).pack(side="left", fill="x", expand=True, padx=(8, 0))
         self.trade_result_var = tk.StringVar(value="Load a league to review a trade.")
-        ttk.Label(trade_tab, textvariable=self.trade_result_var, font=("TkDefaultFont", 12, "bold"), wraplength=850).pack(anchor="w", pady=(6, 0))
-        balance_row = ttk.Frame(trade_tab)
+        ttk.Label(trade_details, textvariable=self.trade_result_var, font=("TkDefaultFont", 12, "bold"), wraplength=850).pack(anchor="w", pady=(6, 0))
+        balance_row = ttk.Frame(trade_details)
         balance_row.pack(fill="x", pady=(3, 0))
         ttk.Label(balance_row, text="Trade balance:").pack(side="left")
         self.trade_balance_canvas = tk.Canvas(
@@ -1530,15 +1596,15 @@ class App(tk.Tk):
         self.trade_balance_summary = tk.StringVar(value="Select players on both sides.")
         ttk.Label(balance_row, textvariable=self.trade_balance_summary).pack(side="left")
         self.trade_stats_guy_result_var = tk.StringVar(value="Stats Guy trade values will appear here after loading.")
-        ttk.Label(trade_tab, textvariable=self.trade_stats_guy_result_var, font=("TkDefaultFont", 10, "bold"),
+        ttk.Label(trade_details, textvariable=self.trade_stats_guy_result_var, font=("TkDefaultFont", 10, "bold"),
                   wraplength=850).pack(anchor="w", pady=(3, 0))
         self.trade_impact_var = tk.StringVar(value="Roster and lineup impact details will appear here.")
-        impact_row = ttk.Frame(trade_tab)
+        impact_row = ttk.Frame(trade_details)
         impact_row.pack(fill="x", pady=(5, 0))
         self.trade_impact_summary = tk.StringVar(value="Roster impact appears when you select players.")
         ttk.Label(impact_row, textvariable=self.trade_impact_summary, wraplength=760).pack(side="left", anchor="w", fill="x", expand=True)
         ttk.Button(impact_row, text="View Lineup Impact", command=self._show_lineup_impact).pack(side="right", padx=(8, 0))
-        trade_history_panel = ttk.LabelFrame(trade_tab, text="Selected Players' Value Trends", padding=4)
+        trade_history_panel = ttk.LabelFrame(trade_details, text="Selected Players' Value Trends", padding=4)
         trade_history_panel.pack(fill="x", pady=(4, 0))
         trade_history_toolbar = ttk.Frame(trade_history_panel)
         trade_history_toolbar.pack(fill="x")
@@ -1557,6 +1623,7 @@ class App(tk.Tk):
             "<Motion>", lambda event: self._show_trade_history_hover(event, self.trade_history_canvas)
         )
         self.trade_history_canvas.bind("<Leave>", lambda _event: self._clear_trade_history_hover(self.trade_history_canvas))
+        self.after_idle(self._initialize_trade_review_split)
 
         #Saved Trades keeps proposals available for reopening and editing later.
         self.saved_trade_tab = ttk.Frame(self.workspace, padding=12)
@@ -1678,15 +1745,12 @@ class App(tk.Tk):
         )
         self.trade_builder_tolerance_combo.pack(side="left", padx=(8, 14))
         self.trade_builder_tolerance_combo.bind("<<ComboboxSelected>>", self._trade_builder_options_changed)
-        builder_content = ttk.Frame(builder_tab)
+        builder_content = ttk.PanedWindow(builder_tab, orient="horizontal")
         builder_content.pack(fill="both", expand=True)
-        builder_content.columnconfigure(0, weight=1)
-        builder_content.columnconfigure(1, weight=2)
-        builder_content.rowconfigure(0, weight=1)
         give_box = ttk.LabelFrame(builder_content, text="Players You Would Send", padding=6)
         return_box = ttk.LabelFrame(builder_content, text="Near-Value Returns", padding=6)
-        give_box.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        return_box.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        builder_content.add(give_box, weight=1)
+        builder_content.add(return_box, weight=2)
         builder_search = ttk.Frame(give_box)
         builder_search.pack(fill="x", pady=(0, 5))
         ttk.Label(builder_search, text="Search:").pack(side="left")
@@ -1933,7 +1997,7 @@ class App(tk.Tk):
             self.geometry(f"{width}x{height}+0+0")
 
     def _scroll_trade_tab(self, event):
-        #Use the mouse wheel to reach lower Trade Review sections on short displays.
+        #Use the page scrollbar to reach lower Trade Review sections on short displays.
         if self.workspace.select() != str(self.trade_tab):
             return
         if event.widget.winfo_toplevel() is not self:
@@ -1944,6 +2008,31 @@ class App(tk.Tk):
         if units:
             self.trade_tab_canvas.yview_scroll(units, "units")
             return "break"
+
+    def _initialize_trade_review_split(self):
+        #Start with room for a useful number of roster rows and keep the details fully reachable.
+        self.update_idletasks()
+        panes = self.trade_review_split.panes()
+        roster_pane = self.nametowidget(panes[0]) if panes else None
+        roster_height = max(320, roster_pane.winfo_reqheight() if roster_pane else 0)
+        self._trade_review_details_height = max(320, self.trade_review_details.winfo_reqheight())
+        self.trade_review_split.configure(height=roster_height + self._trade_review_details_height)
+        self.trade_review_split.sashpos(0, roster_height)
+        self.after_idle(self._update_trade_review_scrollregion)
+
+    def _resize_trade_review_split(self, _event=None):
+        #Grow the scrollable page with the roster pane so the summary and graph never get clipped.
+        details_height = getattr(self, "_trade_review_details_height", None)
+        if details_height is None:
+            return
+        roster_height = self.trade_review_split.sashpos(0)
+        if roster_height >= 0:
+            self.trade_review_split.configure(height=roster_height + details_height)
+            self.after_idle(self._update_trade_review_scrollregion)
+
+    def _update_trade_review_scrollregion(self):
+        #Refresh the single page scroll range after its resizable pane changes height.
+        self.trade_tab_canvas.configure(scrollregion=self.trade_tab_canvas.bbox("all"))
 
     def _compact_tree_columns(self):
         #Keep list columns close to their configured widths instead of stretching across wide monitors.
