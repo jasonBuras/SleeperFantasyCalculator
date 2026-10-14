@@ -23,9 +23,9 @@ jobs:
       - name: Verify release tag matches app version
         shell: pwsh
         run: |
-          $source = Get-Content -LiteralPath sleeper_exporter.py -Raw
+          $source = Get-Content -LiteralPath sleeper_core.py -Raw
           if ($source -notmatch 'APP_VERSION\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"') {
-            throw "Could not read APP_VERSION from sleeper_exporter.py."
+            throw "Could not read APP_VERSION from sleeper_core.py."
           }
           $appVersion = $Matches[1]
           if ($env:GITHUB_REF_NAME -ne "v$appVersion") {

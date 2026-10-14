@@ -1,0 +1,6 @@
+Refactored exporter into focused modules
+
+- set the default value history window to one month
+backend stuff:
+- moved shared API and Excel export logic into sleeper_core.py
+- separated trade and insight handlers into dedicated modules
