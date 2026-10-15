@@ -1498,5 +1498,8 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
         except Exception as exc:
             messagebox.showerror("Export Failed", str(exc))
 
+
+
+#Only create the desktop window when this file is launched directly.
 if __name__ == "__main__":
     App().mainloop()
