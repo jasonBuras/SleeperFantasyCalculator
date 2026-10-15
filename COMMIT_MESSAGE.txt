@@ -1,8 +1,4 @@
-Refactored exporter into focused modules
+Minor fixes
 
-- set program to open up to Main Menu tab by default
-- program automatically checks for update on launch
-- set the default value history window to one month
-backend stuff:
-- moved shared API and Excel export logic into sleeper_core.py
-- separated trade and insight handlers into dedicated modules
+- updated the readme to include Trade Builder and installation instructions. 
+- also updated Saved info/data use and Privacy information to include where the data for the program is coming from 
