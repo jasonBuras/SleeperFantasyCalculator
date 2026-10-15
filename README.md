@@ -4,7 +4,7 @@ Fantasy Trade Calculator is a Windows desktop app for exploring your Sleeper fan
 
 The app uses Sleeper's public read-only API and does not need your Sleeper password or an API token. FantasyCalc and Stats Guy Fantasy provide separate player value estimates; these are useful reference points, not guarantees of a player's future performance or what a league mate will accept.
 
-## How to Install (For Windows)
+## How to Install (For Windows) 💻
 1) Go to [Releases](https://github.com/jasonBuras/SleeperFantasyCalculator/releases) and download `FantasyTradeCalculator-Windows.zip` from the latest release's **Assets**.
 2) Extract the ZIP to a folder where you have permission to change files, then run `FantasyTradeCalculator.exe` from that folder. Keeping it there lets the in-app updater replace the executable when you install a future update.
 

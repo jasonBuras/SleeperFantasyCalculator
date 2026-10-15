@@ -507,7 +507,8 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
         #The Main Menu contains league selection and actions; the active context stays in the header.
         self.workspace = ttk.Notebook(main)
         self.workspace.pack(fill="both", expand=True)
-        main_menu_tab = ttk.Frame(self.workspace, padding=12)
+        self.main_menu_tab = ttk.Frame(self.workspace, padding=12)
+        main_menu_tab = self.main_menu_tab
         self.workspace.add(main_menu_tab, text="Main Menu")
         ttk.Label(
             main_menu_tab,
