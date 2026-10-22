@@ -14,6 +14,7 @@ import threading
 import uuid
 import zipfile
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
@@ -27,7 +28,7 @@ from openpyxl.utils import get_column_letter
 
 #This URL is the root used by Sleeper's read-only API.
 BASE_URL = "https://api.sleeper.app/v1"
-APP_VERSION = "1.1.5"
+APP_VERSION = "1.1.6"
 GITHUB_RELEASE_API = "https://api.github.com/repos/jasonBuras/SleeperFantasyCalculator/releases/latest"
 UPDATE_ASSET_NAME = "FantasyTradeCalculator-Windows.zip"
 
@@ -59,6 +60,9 @@ STATSGUY_CACHE = CACHE_DIR / "stats_guy_values.json"
 STATSGUY_CACHE_MAX_AGE_HOURS = 12
 SLEEPER_PROJECTION_CACHE = CACHE_DIR / "sleeper_projections.json"
 SLEEPER_PROJECTION_CACHE_MAX_AGE_HOURS = 6
+SLEEPER_ACTUALS_CACHE = CACHE_DIR / "sleeper_actual_points.json"
+SLEEPER_ACTUALS_CACHE_MAX_AGE_HOURS = 3
+SLEEPER_WEEKLY_ACTUALS_CACHE = CACHE_DIR / "sleeper_weekly_actual_points.json"
 VALUE_HISTORY_WINDOWS = {
     "7 days": 8,
     "14 days": 15,
@@ -171,6 +175,147 @@ class SleeperAPI:
             return values, metric
         except requests.RequestException as exc:
             raise SleeperAPIError(f"Could not load Sleeper weekly projections:\n{exc}") from exc
+
+    def get_actual_points_per_game(self, season, through_week, metric):
+        #Aggregate completed weekly Sleeper stat lines into season points per game.
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cache_key = f"{season}:{through_week}:{metric}"
+        try:
+            age_hours = (datetime.now().timestamp() - SLEEPER_ACTUALS_CACHE.stat().st_mtime) / 3600
+            if age_hours < SLEEPER_ACTUALS_CACHE_MAX_AGE_HOURS:
+                cached = json.loads(SLEEPER_ACTUALS_CACHE.read_text(encoding="utf-8"))
+                if cached.get("key") == cache_key and isinstance(cached.get("values"), dict):
+                    return cached["values"]
+        except (OSError, ValueError, AttributeError):
+            pass
+
+        if int(through_week) <= 0:
+            return {}
+
+        def load_week(week):
+            url = f"{BASE_URL}/stats/nfl/regular/{season}/{week}"
+            try:
+                response = requests.get(
+                    url, headers={"User-Agent": "FantasyTradeCalculator/1.0"}, timeout=20,
+                )
+                response.raise_for_status()
+                payload = response.json()
+            except (requests.RequestException, ValueError) as exc:
+                raise SleeperAPIError(f"Could not load Sleeper actual stats for Week {week}:\n{exc}") from exc
+            if isinstance(payload, dict):
+                players = payload.get("players") if isinstance(payload.get("players"), dict) else payload
+                return list(players.items()) if isinstance(players, dict) else []
+            if isinstance(payload, list):
+                return [
+                    (str(row.get("player_id")), row) for row in payload
+                    if isinstance(row, dict) and row.get("player_id") not in (None, "")
+                ]
+            raise SleeperAPIError(f"Sleeper actual stats for Week {week} had an unexpected format.")
+
+        try:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                weekly_rows = list(executor.map(load_week, range(1, int(through_week) + 1)))
+            totals = {}
+            for rows in weekly_rows:
+                for player_id, row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    stats = row.get("stats") if isinstance(row.get("stats"), dict) else row
+                    points = stats.get(metric)
+                    if points is None:
+                        continue
+                    try:
+                        points = float(points)
+                        games = stats.get("gp", stats.get("gms_active"))
+                        games = float(games) if games is not None else 1.0
+                    except (TypeError, ValueError):
+                        continue
+                    if games <= 0:
+                        continue
+                    entry = totals.setdefault(str(player_id), [0.0, 0.0])
+                    entry[0] += points
+                    entry[1] += games
+            values = {
+                player_id: points / games
+                for player_id, (points, games) in totals.items() if games > 0
+            }
+        except SleeperAPIError:
+            raise
+        except Exception as exc:
+            raise SleeperAPIError(f"Could not load Sleeper actual player stats:\n{exc}") from exc
+
+        try:
+            SLEEPER_ACTUALS_CACHE.write_text(
+                json.dumps({"key": cache_key, "values": values}), encoding="utf-8",
+            )
+        except OSError:
+            pass
+        return values
+
+    def get_actual_points_by_week(self, season, through_week, metric):
+        #Return completed weekly point samples so the app can compare recent games with prior form.
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cache_key = f"{season}:{through_week}:{metric}"
+        try:
+            cache_age = (datetime.now().timestamp() - SLEEPER_WEEKLY_ACTUALS_CACHE.stat().st_mtime) / 3600
+            if cache_age < SLEEPER_ACTUALS_CACHE_MAX_AGE_HOURS:
+                cached = json.loads(SLEEPER_WEEKLY_ACTUALS_CACHE.read_text(encoding="utf-8"))
+                if cached.get("key") == cache_key and isinstance(cached.get("values"), dict):
+                    return cached["values"]
+        except (OSError, ValueError, AttributeError):
+            pass
+
+        if int(through_week) <= 0:
+            return {}
+
+        def load_week(week):
+            url = f"{BASE_URL}/stats/nfl/regular/{season}/{week}"
+            try:
+                response = requests.get(
+                    url, headers={"User-Agent": "FantasyTradeCalculator/1.0"}, timeout=20,
+                )
+                response.raise_for_status()
+                payload = response.json()
+            except (requests.RequestException, ValueError) as exc:
+                raise SleeperAPIError(f"Could not load Sleeper actual stats for Week {week}:\n{exc}") from exc
+            if isinstance(payload, dict):
+                players = payload.get("players") if isinstance(payload.get("players"), dict) else payload
+                return list(players.items()) if isinstance(players, dict) else []
+            if isinstance(payload, list):
+                return [
+                    (str(row.get("player_id")), row) for row in payload
+                    if isinstance(row, dict) and row.get("player_id") not in (None, "")
+                ]
+            raise SleeperAPIError(f"Sleeper actual stats for Week {week} had an unexpected format.")
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            weekly_rows = list(executor.map(load_week, range(1, int(through_week) + 1)))
+        values = {}
+        for week, rows in enumerate(weekly_rows, start=1):
+            for player_id, row in rows:
+                if not isinstance(row, dict):
+                    continue
+                stats = row.get("stats") if isinstance(row.get("stats"), dict) else row
+                points = stats.get(metric)
+                if points is None:
+                    continue
+                try:
+                    points = float(points)
+                    games = float(stats.get("gp", stats.get("gms_active", 1)) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if games <= 0:
+                    continue
+                values.setdefault(str(player_id), []).append({
+                    "week": week, "points": points, "games": games,
+                })
+        try:
+            SLEEPER_WEEKLY_ACTUALS_CACHE.write_text(
+                json.dumps({"key": cache_key, "values": values}), encoding="utf-8",
+            )
+        except OSError:
+            pass
+        return values
 
     def get_nfl_schedule(self, season):
         #Read the current schedule from cache or download nflverse's maintained game schedule.

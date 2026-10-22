@@ -32,6 +32,8 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
         self.value_trend_sort_reverse = {}
         self.value_history_cache = {}
         self.value_history_window_var = tk.StringVar(value="1 month")
+        self.value_trend_performance_window_var = tk.StringVar(value="3 games")
+        self.value_trend_market_window_var = tk.StringVar(value="7 days")
         self.selected_history_player_id = None
         self.trade_history_series = []
         self.trade_history_signature = None
@@ -64,6 +66,13 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
         self.roster_projection_values = {}
         self.roster_projection_metric = ""
         self.roster_projection_error = ""
+        self.season_actual_points = {}
+        self.season_actual_by_week = {}
+        self.season_actual_error = ""
+        self.season_actuals_loaded = False
+        self.roster_projections_loaded = False
+        self.player_performance_ranks = {}
+        self.team_position_quality = {}
         self.roster_history_player_id = None
         self.roster_history_points = []
         self.roster_search_items = []
@@ -610,31 +619,134 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
         ttk.Button(notes_frame, text="Copy Notes", command=self._copy_update_notes).pack(side="right", padx=(6, 0))
         self._set_update_notes(self.update_notes_var.get())
 
+        #League Overview provides a compact landing page and shortcuts into common tasks.
+        overview_tab = ttk.Frame(self.workspace, padding=12)
+        self.league_overview_tab = overview_tab
+        self.workspace.add(overview_tab, text="League Overview")
+        ttk.Label(overview_tab, text="League Overview", font=("TkDefaultFont", 16, "bold")).pack(anchor="w")
+        ttk.Label(
+            overview_tab,
+            text="A quick snapshot of your selected team, this week, and positional depth.",
+        ).pack(anchor="w", pady=(2, 10))
+        overview_controls = ttk.Frame(overview_tab)
+        overview_controls.pack(fill="x", pady=(0, 8))
+        ttk.Label(overview_controls, text="Team:").pack(side="left")
+        self.overview_team_combo = ttk.Combobox(overview_controls, state="readonly", width=36)
+        self.overview_team_combo.pack(side="left", padx=8)
+        self.overview_team_combo.bind("<<ComboboxSelected>>", self._refresh_league_overview)
+        overview_stats = ttk.Frame(overview_tab)
+        overview_stats.pack(fill="x", pady=(0, 10))
+        self.overview_roster_var = tk.StringVar(value="—")
+        self.overview_teams_var = tk.StringVar(value="—")
+        self.overview_week_var = tk.StringVar(value="—")
+        self.overview_bye_var = tk.StringVar(value="—")
+        for title, variable in (
+            ("League Teams", self.overview_teams_var),
+            ("Rostered Players", self.overview_roster_var),
+            ("Current NFL Week", self.overview_week_var),
+            ("Starters on Bye", self.overview_bye_var),
+        ):
+            card = ttk.LabelFrame(overview_stats, text=title, padding=(12, 8))
+            card.pack(side="left", fill="both", expand=True, padx=(0, 8))
+            ttk.Label(card, textvariable=variable, font=("TkDefaultFont", 15, "bold")).pack(anchor="w")
+        overview_body = ttk.Frame(overview_tab)
+        overview_body.pack(fill="both", expand=True)
+        overview_ranks = ttk.LabelFrame(overview_body, text="Position Strength", padding=8)
+        overview_ranks.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        self.overview_position_tree = ttk.Treeview(
+            overview_ranks, columns=("rank", "average", "rostered"), show="tree headings", height=7,
+        )
+        self.overview_position_tree.heading("#0", text="Position")
+        self.overview_position_tree.heading("rank", text="League Rank")
+        self.overview_position_tree.heading("average", text="Avg Player Rank")
+        self.overview_position_tree.heading("rostered", text="Rostered")
+        self.overview_position_tree.column("#0", width=110)
+        self.overview_position_tree.column("rank", width=120, anchor="center")
+        self.overview_position_tree.column("average", width=115, anchor="center")
+        self.overview_position_tree.column("rostered", width=95, anchor="center")
+        self.overview_position_tree.pack(fill="both", expand=True)
+        overview_league_ranks = ttk.LabelFrame(overview_body, text="League Rankings by Position", padding=8)
+        overview_league_ranks.pack(side="left", fill="both", expand=True)
+        self.overview_rank_position = tk.StringVar(value="QB")
+        overview_position_buttons = ttk.Frame(overview_league_ranks)
+        overview_position_buttons.pack(fill="x", pady=(0, 6))
+        for position in ("QB", "RB", "WR", "TE", "K", "DEF"):
+            ttk.Button(
+                overview_position_buttons, text=position,
+                command=lambda selected=position: self._show_overview_position_rankings(selected),
+            ).pack(side="left", padx=(0, 4))
+        overview_rank_list = ttk.Frame(overview_league_ranks)
+        overview_rank_list.pack(fill="both", expand=True)
+        self.overview_league_rank_tree = ttk.Treeview(
+            overview_rank_list,
+            columns=("rank", "team", "average", "rostered"),
+            show="headings", height=7,
+        )
+        #self.overview_league_rank_tree.heading("#0", text="Team")
+        self.overview_league_rank_tree.heading("rank", text="Rank")
+        self.overview_league_rank_tree.heading("team", text="Team")
+        self.overview_league_rank_tree.heading("average", text="Avg Player Rank")
+        self.overview_league_rank_tree.heading("rostered", text="Rostered")
+        #self.overview_league_rank_tree.column("#0", width=180)
+        self.overview_league_rank_tree.column("rank", width=65, anchor="center")
+        self.overview_league_rank_tree.column("team", width=180, anchor="center")
+        self.overview_league_rank_tree.column("average", width=115, anchor="center")
+        self.overview_league_rank_tree.column("rostered", width=80, anchor="center")
+        overview_rank_scroll = ttk.Scrollbar(
+            overview_rank_list, orient="vertical", command=self.overview_league_rank_tree.yview,
+        )
+        self.overview_league_rank_tree.configure(yscrollcommand=overview_rank_scroll.set)
+        self.overview_league_rank_tree.pack(side="left", fill="both", expand=True)
+        overview_rank_scroll.pack(side="right", fill="y")
+        self.performance_rank_note_var = tk.StringVar(
+            value="League performance ranks appear after player actuals and projections load."
+        )
+        ttk.Label(overview_tab, textvariable=self.performance_rank_note_var, wraplength=950).pack(
+            anchor="w", pady=(8, 0),
+        )
+
         #Position Needs compares one team's roster counts with the league lineup slots.
         needs_tab = ttk.Frame(self.workspace, padding=12)
         self.position_needs_tab = needs_tab
         self.workspace.add(needs_tab, text="Position Needs")
-        ttk.Label(needs_tab, text="Review roster depth against your league's starting lineup.").pack(anchor="w", pady=(0, 8))
+        ttk.Label(
+            needs_tab,
+            text="Compare your roster depth with the league and see where each position ranks."
+        ).pack(anchor="w", pady=(0, 8))
         needs_controls = ttk.Frame(needs_tab)
         needs_controls.pack(fill="x", pady=(0, 8))
         ttk.Label(needs_controls, text="Team:").pack(side="left")
         self.needs_team_combo = ttk.Combobox(needs_controls, state="readonly", width=36)
         self.needs_team_combo.pack(side="left", padx=8)
         self.needs_team_combo.bind("<<ComboboxSelected>>", self._show_position_needs)
-        self.needs_tree = ttk.Treeview(needs_tab, columns=("required", "starting", "rostered", "bench", "assessment"), show="tree headings", height=8)
+        self.needs_tree = ttk.Treeview(
+            needs_tab,
+            columns=("rank", "average", "ranked_players", "required", "starting", "rostered", "bench", "assessment"),
+            show="tree headings", height=8,
+        )
         self.needs_tree.heading("#0", text="Position")
-        for key, label in (("required", "Starter Spots"), ("starting", "Starting"), ("rostered", "Rostered"), ("bench", "Bench Depth"), ("assessment", "Overview")):
+        for key, label in (("rank", "League Rank"), ("average", "Avg Player Rank"),
+                           ("ranked_players", "Players Ranked"), ("required", "Starter Spots"),
+                           ("starting", "Starting"), ("rostered", "Rostered"),
+                           ("bench", "Bench Depth"), ("assessment", "Overview")):
             self.needs_tree.heading(key, text=label)
         self.needs_tree.column("#0", width=125)
+        self.needs_tree.column("rank", width=115, anchor="center")
+        self.needs_tree.column("average", width=120, anchor="center")
+        self.needs_tree.column("ranked_players", width=110, anchor="center")
         for key in ("required", "starting", "rostered", "bench"):
             self.needs_tree.column(key, width=95, anchor="center")
         self.needs_tree.column("assessment", width=190)
         self.needs_tree.pack(fill="both", expand=True)
         self.needs_summary_var = tk.StringVar(value="Load a league to see position depth.")
         ttk.Label(needs_tab, textvariable=self.needs_summary_var, wraplength=850).pack(anchor="w", pady=(8, 0))
+        ttk.Label(needs_tab, textvariable=self.performance_rank_note_var, wraplength=950).pack(
+            anchor="w", pady=(4, 0),
+        )
 
         #Roster View groups a selected team's players by their Sleeper lineup assignment.
         roster_tab = ttk.Frame(self.workspace, padding=12)
+        self.roster_tab = roster_tab
         self.workspace.add(roster_tab, text="Roster View")
         ttk.Label(roster_tab, text="See each player's lineup slot, availability, bye week, and weekly projection.",
                   font=("TkDefaultFont", 11, "bold")).pack(anchor="w", pady=(0, 7))
@@ -704,6 +816,7 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
 
         #Weekly Help brings matchup context, bye coverage, and waiver options together.
         weekly_tab = ttk.Frame(self.workspace, padding=12)
+        self.weekly_tab = weekly_tab
         self.workspace.add(weekly_tab, text="Weekly Help")
         ttk.Label(weekly_tab, text="Plan this week around your matchup, byes, and available players.",
                   font=("TkDefaultFont", 11, "bold")).pack(anchor="w", pady=(0, 7))
@@ -716,7 +829,8 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
         ttk.Label(weekly_controls, text="Waiver focus:").pack(side="left")
         self.weekly_filter_combo = ttk.Combobox(
             weekly_controls, state="readonly", width=20,
-            values=("Bye Coverage", "All Positions", "QB", "RB", "WR", "TE", "K", "DEF"),
+            values=("Bye Coverage", "All Positions", "QB", "RB", "WR", "TE", "FLEX",
+                    "Superflex", "Kicker", "Defense"),
         )
         self.weekly_filter_combo.current(0)
         self.weekly_filter_combo.pack(side="left", padx=8)
@@ -745,7 +859,7 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
         weekly_list = ttk.Frame(weekly_tab)
         weekly_list.pack(fill="both", expand=True, pady=(5, 0))
         self.weekly_tree = ttk.Treeview(
-            weekly_list, columns=("position", "nfl_team", "status", "bye", "value"),
+            weekly_list, columns=("position", "nfl_team", "status", "bye", "projection", "value"),
             show="tree headings", selectmode="browse", height=8,
         )
         self.weekly_tree.heading("#0", text="Player", command=lambda: self._sort_weekly_waivers("name"))
@@ -753,12 +867,14 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
         self.weekly_tree.heading("nfl_team", text="NFL Team", command=lambda: self._sort_weekly_waivers("nfl_team"))
         self.weekly_tree.heading("status", text="Status", command=lambda: self._sort_weekly_waivers("status"))
         self.weekly_tree.heading("bye", text="Bye Week", command=lambda: self._sort_weekly_waivers("bye"))
+        self.weekly_tree.heading("projection", text="Proj Points", command=lambda: self._sort_weekly_waivers("projection"))
         self.weekly_tree.heading("value", text="FC Value", command=lambda: self._sort_weekly_waivers("value"))
         self.weekly_tree.column("#0", width=240)
         self.weekly_tree.column("position", width=110, anchor="center")
         self.weekly_tree.column("nfl_team", width=100, anchor="center")
         self.weekly_tree.column("status", width=130, anchor="center")
         self.weekly_tree.column("bye", width=90, anchor="center")
+        self.weekly_tree.column("projection", width=100, anchor="e")
         self.weekly_tree.column("value", width=100, anchor="e")
         weekly_scroll = ttk.Scrollbar(weekly_list, orient="vertical", command=self.weekly_tree.yview)
         self.weekly_tree.configure(yscrollcommand=weekly_scroll.set)
@@ -803,6 +919,24 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
         self.value_trend_team_combo.bind("<<ComboboxSelected>>", self._refresh_value_trends)
         self.value_trend_source_status = tk.StringVar(value="Load a league to compare value sources.")
         ttk.Label(trends_controls, textvariable=self.value_trend_source_status).pack(side="left", fill="x", expand=True)
+        trend_metric_controls = ttk.Frame(trends_tab)
+        trend_metric_controls.pack(fill="x", pady=(0, 6))
+        ttk.Label(trend_metric_controls, text="Performance window:").pack(side="left")
+        performance_window_combo = ttk.Combobox(
+            trend_metric_controls, state="readonly", width=10,
+            textvariable=self.value_trend_performance_window_var,
+            values=("3 games", "5 games", "10 games"),
+        )
+        performance_window_combo.pack(side="left", padx=(6, 16))
+        performance_window_combo.bind("<<ComboboxSelected>>", self._refresh_value_trends)
+        ttk.Label(trend_metric_controls, text="Market change window:").pack(side="left")
+        market_window_combo = ttk.Combobox(
+            trend_metric_controls, state="readonly", width=10,
+            textvariable=self.value_trend_market_window_var,
+            values=("7 days", "14 days", "30 days"),
+        )
+        market_window_combo.pack(side="left", padx=(6, 0))
+        market_window_combo.bind("<<ComboboxSelected>>", self._value_trend_market_window_changed)
         stats_guy_credit = ttk.Label(
             trends_tab, text="Stats Guy Fantasy values and value history · statsguyfantasy.com",
             foreground="#1f5a92", cursor="hand2", font=("TkDefaultFont", 9, "bold"),
@@ -824,12 +958,17 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
         trend_list = ttk.Frame(trends_tab)
         trend_list.pack(fill="both", expand=True)
         self.value_trend_tree = ttk.Treeview(
-            trend_list, columns=("position", "rostered_by", "fc", "fc30", "stats_guy", "spread"),
+            trend_list,
+            columns=("position", "rostered_by", "recent_ppg", "baseline_ppg", "momentum",
+                     "fc", "fc30", "stats_guy", "spread"),
             show="tree headings", selectmode="browse", height=8,
         )
         self.value_trend_tree.heading("#0", text="Player", command=lambda: self._sort_value_trends("name"))
         self.value_trend_tree.heading("position", text="Position", command=lambda: self._sort_value_trends("position"))
         self.value_trend_tree.heading("rostered_by", text="Rostered By", command=lambda: self._sort_value_trends("rostered_by"))
+        self.value_trend_tree.heading("recent_ppg", text="Recent PPG", command=lambda: self._sort_value_trends("recent_ppg"))
+        self.value_trend_tree.heading("baseline_ppg", text="Prior PPG", command=lambda: self._sort_value_trends("baseline_ppg"))
+        self.value_trend_tree.heading("momentum", text="Form Δ", command=lambda: self._sort_value_trends("momentum"))
         self.value_trend_tree.heading("fc", text="FantasyCalc", command=lambda: self._sort_value_trends("fc"))
         self.value_trend_tree.heading("fc30", text="FC 30d Δ", command=lambda: self._sort_value_trends("fc30"))
         self.value_trend_tree.heading("stats_guy", text="Stats Guy", command=lambda: self._sort_value_trends("stats_guy"))
@@ -837,17 +976,24 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
         self.value_trend_tree.column("#0", width=230)
         self.value_trend_tree.column("position", width=85, anchor="center")
         self.value_trend_tree.column("rostered_by", width=220)
+        for column in ("recent_ppg", "baseline_ppg", "momentum"):
+            self.value_trend_tree.column(column, width=115, anchor="e")
         for column in ("fc", "fc30", "stats_guy", "spread"):
-            self.value_trend_tree.column(column, width=100, anchor="e")
+            self.value_trend_tree.column(column, width=90, anchor="e")
         trend_scroll = ttk.Scrollbar(trend_list, orient="vertical", command=self.value_trend_tree.yview)
         self.value_trend_tree.configure(yscrollcommand=trend_scroll.set)
+        trend_xscroll = ttk.Scrollbar(trend_list, orient="horizontal", command=self.value_trend_tree.xview)
+        self.value_trend_tree.configure(xscrollcommand=trend_xscroll.set)
         self.value_trend_tree.pack(side="left", fill="both", expand=True)
         trend_scroll.pack(side="right", fill="y")
+        trend_xscroll.pack(side="bottom", fill="x")
         self.value_trend_tree.bind("<<TreeviewSelect>>", self._select_value_trend_player)
         self.value_trend_detail = tk.StringVar(value="Select a player to see volatility and the recent value history.")
-        history_panel = ttk.LabelFrame(trends_tab, text="Selected Player: History and Volatility", padding=8)
+        history_panel = ttk.LabelFrame(trends_tab, text="Selected Player: Performance and Market Trends", padding=8)
         history_panel.pack(fill="x", pady=(7, 0))
-        self._build_history_window_control(history_panel, action=lambda: self._open_player_history_graph("trends"))
+        ttk.Button(
+            history_panel, text="Open Graph", command=lambda: self._open_player_history_graph("trends"),
+        ).pack(anchor="e", pady=(0, 4))
         ttk.Label(history_panel, textvariable=self.value_trend_detail, wraplength=1050,
                   justify="left").pack(anchor="w")
         self.value_history_canvas = tk.Canvas(
@@ -1392,6 +1538,7 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
             display = f"{team_name} ({manager})" if manager and manager.casefold() != team_name.casefold() else team_name
             self.team_options.append((display, team.get("Roster ID")))
         options = [display for display, _roster_id in self.team_options]
+        self.overview_team_combo["values"] = options
         self.needs_team_combo["values"] = options
         self.suggestion_team_combo["values"] = options
         self.weekly_team_combo["values"] = options
@@ -1408,6 +1555,7 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
         default_index = next((i for i, (_name, roster_id) in enumerate(self.team_options)
                               if own_roster_id is not None and str(roster_id) == own_roster_id), 0)
         if options:
+            self.overview_team_combo.current(default_index)
             self.needs_team_combo.current(default_index)
             self.suggestion_team_combo.current(default_index)
             self.weekly_team_combo.current(default_index)
@@ -1425,6 +1573,14 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
         self.weekly_schedule_error = ""
         self.roster_projection_values = {}
         self.roster_projection_metric = ""
+        self.roster_projection_error = ""
+        self.roster_projections_loaded = False
+        self.season_actual_points = {}
+        self.season_actual_by_week = {}
+        self.season_actual_error = ""
+        self.season_actuals_loaded = False
+        self.player_performance_ranks = {}
+        self.team_position_quality = {}
         self.roster_projection_note.set("Loading this week's Sleeper projections…")
         self.roster_history_player_id = None
         self.roster_history_points = []
@@ -1432,7 +1588,9 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
         self.weekly_history_player_id = None
         self.weekly_history_points = []
         self.weekly_history_detail.set("Select a waiver option to see its recent value movement.")
+        self._refresh_player_performance_ranks()
         self._refresh_weekly_help()
+        self._refresh_league_overview()
         self._refresh_roster_view()
         self._refresh_value_trends()
         self._refresh_trade_ideas()

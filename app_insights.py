@@ -1,5 +1,6 @@
 # App behavior mixins. Shared libraries and application constants come from sleeper_core.
 from sleeper_core import *
+from datetime import date, timedelta
 
 class InsightsFeatures:
     def _format_changed(self, _event=None):
@@ -58,6 +59,7 @@ class InsightsFeatures:
         self.value_trend_format_note.set(
             f"Stats Guy format: {supported_format}. Its API doesn't adjust for PPR, TE premium, or team count; "
             "it covers QB/RB/WR/TE. FantasyCalc uses your league's closest supported settings."
+            "Form compares the selected recent-game window with earlier games; market change uses Stats Guy history."
         )
         if self.stats_guy_error:
             self.value_trend_source_status.set(f"Stats Guy unavailable: {self.stats_guy_error}")
@@ -89,6 +91,9 @@ class InsightsFeatures:
             stats_values = stats_card.get("value") or {}
             stats_value = stats_values.get(value_format) if isinstance(stats_values, dict) else None
             spread = (fc_value - stats_value) if fc_value is not None and stats_value is not None else None
+            recent_ppg, baseline_ppg, momentum, recent_count, baseline_count = (
+                self._performance_momentum_for_player(player_id)
+            )
             self.value_trend_rows.append({
                 "id": player_id,
                 "name": str(row["Player"]),
@@ -96,11 +101,55 @@ class InsightsFeatures:
                 "rostered_by": roster_owners.get(str(row.get("Roster ID")), "Free Agent"),
                 "fc": fc_value,
                 "fc30": fc_trend,
+                "recent_ppg": recent_ppg,
+                "baseline_ppg": baseline_ppg,
+                "momentum": momentum,
+                "recent_count": recent_count,
+                "baseline_count": baseline_count,
                 "stats_guy": stats_value,
                 "spread": spread,
             })
         self.value_trend_sort_reverse = {"fc": True}
+        performance_window = self.value_trend_performance_window_var.get().split()[0]
+        self.value_trend_tree.heading("recent_ppg", text=f"Recent PPG ({performance_window}g)")
+        self.value_trend_tree.heading("baseline_ppg", text="Prior Season PPG")
         self._sort_value_trends("fc", toggle=False)
+
+    def _performance_momentum_for_player(self, player_id):
+        #Compare recent completed-game points per game with earlier games in the season.
+        try:
+            window = int(self.value_trend_performance_window_var.get().split()[0])
+        except (AttributeError, TypeError, ValueError):
+            window = 3
+        weeks = getattr(self, "season_actual_by_week", {}).get(str(player_id), [])
+        game_scores = []
+        for sample in sorted(weeks, key=lambda item: int(item.get("week", 0))):
+            try:
+                games = max(0, int(round(float(sample.get("games", 0)))))
+                points = float(sample["points"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if games:
+                #Sleeper returns weekly totals; if a week spans multiple games, use its per-game average.
+                game_scores.extend([points / games] * games)
+        if not game_scores:
+            return None, None, None, 0, 0
+        recent = game_scores[-window:]
+        baseline = game_scores[:-len(recent)] if recent else []
+        recent_average = sum(recent) / len(recent) if recent else None
+        baseline_average = sum(baseline) / len(baseline) if baseline else None
+        momentum = recent_average - baseline_average if recent_average is not None and baseline_average is not None else None
+        return recent_average, baseline_average, momentum, len(recent), len(baseline)
+
+    def _value_trend_market_window_days(self):
+        try:
+            return int(self.value_trend_market_window_var.get().split()[0])
+        except (AttributeError, TypeError, ValueError):
+            return 7
+
+    def _value_trend_market_window_changed(self, _event=None):
+        #Reload the selected player's history using the chosen market-movement window.
+        self._select_value_trend_player()
 
     @staticmethod
     def _display_value(value, signed=False):
@@ -139,10 +188,20 @@ class InsightsFeatures:
             valued.sort(key=lambda row: float(row[column]), reverse=reverse)
             rows = valued + missing
         for row in rows:
+            recent_text = (
+                f"{row['recent_ppg']:.1f} ({row['recent_count']}g)"
+                if row.get("recent_ppg") is not None else "—"
+            )
+            baseline_text = (
+                f"{row['baseline_ppg']:.1f} ({row['baseline_count']}g)"
+                if row.get("baseline_ppg") is not None else "—"
+            )
             self.value_trend_tree.insert(
                 "", "end", iid=row["id"], text=row["name"], tags=(row["id"],),
-                values=(row["position"], row["rostered_by"], self._display_value(row["fc"]),
-                        self._display_value(row["fc30"], signed=True),
+                values=(row["position"], row["rostered_by"],
+                        recent_text, baseline_text,
+                        self._display_value(row.get("momentum"), signed=True),
+                        self._display_value(row["fc"]), self._display_value(row["fc30"], signed=True),
                         self._display_value(row["stats_guy"]),
                         self._display_value(row["spread"], signed=True)),
             )
@@ -155,10 +214,14 @@ class InsightsFeatures:
         player_id = str(selection[0])
         self.selected_history_player_id = player_id
         value_format = self._stats_guy_format()
-        window = self._history_window_limit()
-        cache_key = (player_id, value_format, window)
+        market_window = self._value_trend_market_window_days()
+        history_window = self._history_window_limit()
+        fetch_window = max(history_window, market_window)
+        cache_key = (player_id, value_format, fetch_window)
         if cache_key in self.value_history_cache:
-            self._render_value_history(player_id, value_format, self.value_history_cache[cache_key])
+            self._render_value_history(
+                player_id, value_format, self.value_history_cache[cache_key], market_window_days=market_window,
+            )
             return
         player = self.stats_guy_players.get(player_id, {})
         self.value_trend_detail.set(
@@ -169,7 +232,7 @@ class InsightsFeatures:
 
         def task():
             try:
-                return self.api.get_stats_guy_history(player_id, value_format, window=window), None
+                return self.api.get_stats_guy_history(player_id, value_format, window=fetch_window), None
             except Exception as exc:
                 return None, str(exc)
 
@@ -181,8 +244,11 @@ class InsightsFeatures:
             self.value_history_cache[cache_key] = history
             if (self.selected_history_player_id == player_id and
                     self._stats_guy_format() == value_format and
-                    self._history_window_limit() == window):
-                self._render_value_history(player_id, value_format, history)
+                    self._value_trend_market_window_days() == market_window and
+                    self._history_window_limit() == history_window):
+                self._render_value_history(
+                    player_id, value_format, history, market_window_days=market_window,
+                )
 
         self.run_background(task, loaded)
 
@@ -652,7 +718,8 @@ class InsightsFeatures:
             canvas.delete("trade-history-hover")
 
     def _render_value_history(self, player_id, value_format, history_payload,
-                              canvas=None, detail_var=None, points_name="value_history_points"):
+                              canvas=None, detail_var=None, points_name="value_history_points",
+                              market_window_days=None):
         #Summarize the recent series and compute volatility from daily percentage changes.
         history = []
         for point in history_payload.get("history", []):
@@ -666,7 +733,19 @@ class InsightsFeatures:
         setattr(self, points_name, history)
         player = self.stats_guy_players.get(player_id, {})
         if not history:
-            detail_var.set(f"No Stats Guy history is available for {player.get('name', 'this player')}.")
+            detail = f"No Stats Guy market history is available for {player.get('name', 'this player')}."
+            trend_row = next((row for row in self.value_trend_rows if row["id"] == str(player_id)), None)
+            if trend_row:
+                if trend_row.get("recent_ppg") is not None and trend_row.get("baseline_ppg") is not None:
+                    detail += (
+                        f" Performance: {trend_row['recent_ppg']:.1f} PPG over {trend_row['recent_count']} "
+                        f"recent game(s) vs {trend_row['baseline_ppg']:.1f} PPG across "
+                        f"{trend_row['baseline_count']} earlier game(s) "
+                        f"({trend_row['momentum']:+.1f} PPG)."
+                    )
+                else:
+                    detail += " Performance momentum is unavailable until both recent games and earlier baseline games exist."
+            detail_var.set(detail)
             self._draw_history_chart(canvas, history, "No history is available for this player.")
             return
         daily_changes = []
@@ -676,18 +755,51 @@ class InsightsFeatures:
         volatility = statistics.pstdev(daily_changes) if len(daily_changes) > 1 else None
         largest_swing = max((abs(change) for change in daily_changes), default=None)
         current_value = history[-1][1]
-        week_change = current_value - history[-8][1] if len(history) >= 8 else None
-        month_change = current_value - history[-31][1] if len(history) >= 31 else None
+        if market_window_days is not None:
+            try:
+                cutoff = date.fromisoformat(history[-1][0][:10]) - timedelta(days=market_window_days)
+                market_points = [point for point in history
+                                 if date.fromisoformat(point[0][:10]) >= cutoff]
+            except ValueError:
+                market_points = history[-(market_window_days + 1):]
+            market_change = current_value - market_points[0][1] if len(market_points) >= 2 else None
+        else:
+            week_change = current_value - history[-8][1] if len(history) >= 8 else None
+            month_change = current_value - history[-31][1] if len(history) >= 31 else None
         low_value = min(value for _date, value in history)
         high_value = max(value for _date, value in history)
         volatility_text = f"{volatility:.2f}%" if volatility is not None else "not enough snapshots"
         swing_text = f"{largest_swing:.2f}%" if largest_swing is not None else "—"
-        detail_var.set(
+        history_summary = (
             f"{player.get('name', 'Player')} · {value_format.replace('_', ' ').title()} · "
             f"{len(history)} daily snapshots ({history[0][0]} to {history[-1][0]}). "
-            f"7-day change: {self._display_value(week_change, signed=True)}; "
-            f"30-day change: {self._display_value(month_change, signed=True)}. "
-            f"Daily volatility: {volatility_text} standard deviation; "
+        )
+        if market_window_days is not None:
+            history_summary += (
+                f"Stats Guy market change over the available {market_window_days}-day window: "
+                f"{self._display_value(market_change, signed=True)}. "
+            )
+            trend_row = next((row for row in self.value_trend_rows if row["id"] == str(player_id)), None)
+            if trend_row:
+                if trend_row.get("recent_ppg") is not None and trend_row.get("baseline_ppg") is not None:
+                    history_summary += (
+                        f"Performance: {trend_row['recent_ppg']:.1f} PPG over {trend_row['recent_count']} "
+                        f"recent game(s) vs {trend_row['baseline_ppg']:.1f} PPG across "
+                        f"{trend_row['baseline_count']} earlier game(s) "
+                        f"({trend_row['momentum']:+.1f} PPG). "
+                    )
+                else:
+                    history_summary += (
+                        f"Performance momentum is unavailable (recent games: {trend_row['recent_count']}; "
+                        f"earlier baseline games: {trend_row['baseline_count']}). "
+                    )
+        else:
+            history_summary += (
+                f"7-day change: {self._display_value(week_change, signed=True)}; "
+                f"30-day change: {self._display_value(month_change, signed=True)}. "
+            )
+        detail_var.set(
+            history_summary + f"Daily volatility: {volatility_text} standard deviation; "
             f"largest daily move: {swing_text}. Range: {low_value:,.0f}–{high_value:,.0f}. "
             "Historical variability, not a forecast."
         )
@@ -815,8 +927,10 @@ class InsightsFeatures:
             (self.weekly_state, self.weekly_matchups, self.weekly_bye_weeks,
              self.weekly_context_error, self.weekly_schedule_error) = result
             self._refresh_weekly_help()
+            self._refresh_league_overview()
             self._refresh_trade_bye_weeks()
             self._load_roster_projections()
+            self._load_season_actuals()
 
         self.run_background(task, loaded)
 
@@ -965,10 +1079,21 @@ class InsightsFeatures:
             self.weekly_waiver_count.set("No free-agent players were found in the Sleeper player directory.")
             return
         focus = self.weekly_filter_combo.get() or "Bye Coverage"
+        position_filters = {
+            "QB": {"QB"},
+            "RB": {"RB"},
+            "WR": {"WR"},
+            "TE": {"TE"},
+            "FLEX": {"RB", "WR", "TE", "FLEX"},
+            "Superflex": {"QB", "RB", "WR", "TE", "FLEX"},
+            "Kicker": {"K", "KICKER"},
+            "Defense": {"DEF", "DST", "D/ST", "DEFENSE"},
+        }
+        required_positions = position_filters.get(focus)
         rows = []
         for _, player in agents.iterrows():
             positions = {part.strip().upper() for part in str(player.get("Position", "")).split(",") if part.strip()}
-            if focus in {"QB", "RB", "WR", "TE", "K", "DEF"} and focus not in positions:
+            if required_positions and not positions.intersection(required_positions):
                 continue
             if focus == "Bye Coverage" and self.weekly_priority_positions and not positions.intersection(self.weekly_priority_positions):
                 continue
@@ -977,6 +1102,7 @@ class InsightsFeatures:
                 continue
             player_id = str(player.get("Player ID", ""))
             value = self.fantasycalc_values.get(player_id)
+            projection = self.roster_projection_values.get(player_id)
             rows.append({
                 "id": player_id,
                 "name": str(player.get("Player", "")),
@@ -986,6 +1112,7 @@ class InsightsFeatures:
                 "bye": str(self.weekly_bye_weeks.get(
                     self._normalize_nfl_team_code(player.get("NFL Team", "")), "—"
                 )),
+                "projection": projection,
                 "value": value,
             })
         self.weekly_waiver_rows = rows
@@ -996,7 +1123,7 @@ class InsightsFeatures:
             focus_text = "all positions (no starting players marked on bye)"
         self.weekly_waiver_count.set(
             f"Showing {len(rows)} available player(s) for {focus_text}. "
-            "Click a column heading to sort; N/A means FantasyCalc has no value for that player."
+            "Click a column heading to sort; — means no projection is available, and N/A means FantasyCalc has no value."
         )
 
     def _sort_weekly_waivers(self, column, toggle=True):
@@ -1016,6 +1143,11 @@ class InsightsFeatures:
             missing = [row for row in rows if row["value"] is None]
             known.sort(key=lambda row: row["value"], reverse=reverse)
             rows = known + missing
+        elif column == "projection":
+            known = [row for row in rows if row["projection"] is not None]
+            missing = [row for row in rows if row["projection"] is None]
+            known.sort(key=lambda row: row["projection"], reverse=reverse)
+            rows = known + missing
         elif column == "name":
             rows.sort(key=lambda row: (row["name"].rsplit(" ", 1)[-1].casefold(), row["name"].casefold()), reverse=reverse)
         elif column == "position":
@@ -1026,10 +1158,12 @@ class InsightsFeatures:
             rows.sort(key=lambda row: row[column].casefold(), reverse=reverse)
         for index, row in enumerate(rows):
             shown_value = f"{row['value']:,.0f}" if row["value"] is not None else "N/A"
+            shown_projection = f"{row['projection']:.1f}" if row["projection"] is not None else "—"
             iid = row["id"] or f"weekly-{index}"
             self.weekly_tree.insert(
                 "", "end", iid=iid, text=row["name"],
-                values=(row["position"], row["nfl_team"], row["status"], row["bye"], shown_value),
+                values=(row["position"], row["nfl_team"], row["status"], row["bye"],
+                        shown_projection, shown_value),
             )
 
     def _load_fantasycalc(self):

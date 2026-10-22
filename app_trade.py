@@ -110,13 +110,18 @@ class TradeFeatures:
         league = self.selected_league() or {}
         league_id = str(league.get("league_id", ""))
         season = league.get("season")
+        self.roster_projections_loaded = False
         state_season = self.weekly_state.get("league_season") or self.weekly_state.get("season")
         week = self.weekly_state.get("display_week") or self.weekly_state.get("week") or self.weekly_state.get("leg")
         if not season or not week or (state_season and str(state_season) != str(season)):
             self.roster_projection_values = {}
+            self.roster_projection_metric = ""
             self.roster_projection_error = ""
+            self.roster_projections_loaded = True
             self.roster_projection_note.set("No current-week projections for this league season.")
             self._refresh_roster_view()
+            self._refresh_weekly_waivers()
+            self._refresh_player_performance_ranks()
             return
         scoring = league.get("scoring_settings") or {}
         reception_value = float(scoring.get("rec", 0) or 0)
@@ -139,6 +144,7 @@ class TradeFeatures:
             self.roster_projection_values = values
             self.roster_projection_metric = metric
             self.roster_projection_error = error or ""
+            self.roster_projections_loaded = True
             if error:
                 self.roster_projection_note.set("Sleeper projections aren't available right now.")
             elif not values:
@@ -148,6 +154,88 @@ class TradeFeatures:
                 scoring_note = "" if abs(ppr - reception_value) < 0.001 else " · closest scoring match"
                 self.roster_projection_note.set(f"Week {week} Sleeper projections · {ppr_text} baseline{scoring_note}")
             self._refresh_roster_view()
+            self._refresh_weekly_waivers()
+            self._refresh_player_performance_ranks()
+
+        self.run_background(task, loaded)
+
+    def _load_season_actuals(self):
+        #Fetch actual points only through the last completed regular-season week.
+        league = self.selected_league() or {}
+        league_id = str(league.get("league_id", ""))
+        season = str(league.get("season", ""))
+        self.season_actual_error = ""
+        self.season_actuals_loaded = False
+        if not season:
+            self.season_actuals_loaded = True
+            self.season_actual_points = {}
+            self.season_actual_by_week = {}
+            self._refresh_player_performance_ranks()
+            self._refresh_value_trends()
+            return
+
+        state = self.weekly_state or {}
+        state_season = str(state.get("league_season") or state.get("season") or "")
+        season_type = str(state.get("season_type") or "regular").casefold()
+        try:
+            season_number = int(season)
+            state_season_number = int(state_season) if state_season else None
+        except (TypeError, ValueError):
+            season_number = int(datetime.now().year)
+            state_season_number = None
+        if state_season_number is not None and season_number < state_season_number:
+            through_week = 18
+        elif state_season_number is not None and season_number > state_season_number:
+            through_week = 0
+        elif state_season_number == season_number:
+            if season_type in {"post", "off"}:
+                through_week = 18
+            else:
+                week = state.get("week") or state.get("display_week") or state.get("leg")
+                try:
+                    through_week = max(0, int(week) - 1)
+                except (TypeError, ValueError):
+                    through_week = 0
+        else:
+            through_week = 18 if season_number < datetime.now().year else 0
+
+        scoring = league.get("scoring_settings") or {}
+        reception_value = float(scoring.get("rec", 0) or 0)
+        ppr = min((0, 0.5, 1), key=lambda value: abs(value - reception_value))
+        metric = "pts_ppr" if ppr >= 0.75 else "pts_half_ppr" if ppr >= 0.25 else "pts_std"
+        if through_week <= 0:
+            self.season_actual_points = {}
+            self.season_actual_by_week = {}
+            self.season_actual_error = ""
+            self.season_actuals_loaded = True
+            self._refresh_player_performance_ranks()
+            self._refresh_value_trends()
+            return
+
+        self.season_actuals_loaded = False
+
+        def task():
+            try:
+                return self.api.get_actual_points_by_week(season, through_week, metric), ""
+            except Exception as exc:
+                return {}, str(exc)
+
+        def loaded(result):
+            current_league = self.selected_league() or {}
+            if (str(current_league.get("league_id", "")) != league_id or
+                    str(current_league.get("season", "")) != season):
+                return
+            self.season_actual_by_week, self.season_actual_error = result
+            totals = {}
+            for player_id, weeks in self.season_actual_by_week.items():
+                points = sum(float(week["points"]) for week in weeks)
+                games = sum(float(week["games"]) for week in weeks)
+                if games > 0:
+                    totals[player_id] = points / games
+            self.season_actual_points = totals
+            self.season_actuals_loaded = True
+            self._refresh_player_performance_ranks()
+            self._refresh_value_trends()
 
         self.run_background(task, loaded)
 
@@ -282,8 +370,252 @@ class TradeFeatures:
         label = combo.get()
         return next((roster_id for display, roster_id in self.team_options if display == label), None)
 
+    def _refresh_league_overview(self, _event=None):
+        #Summarize the selected team's roster and performance-based positional strength.
+        for item in self.overview_position_tree.get_children():
+            self.overview_position_tree.delete(item)
+        self._show_overview_position_rankings(self.overview_rank_position.get())
+        if self.dataframes is None:
+            self.overview_teams_var.set("—")
+            self.overview_roster_var.set("—")
+            self.overview_week_var.set("—")
+            self.overview_bye_var.set("—")
+            return
+        if _event is not None and self.needs_team_combo.get() != self.overview_team_combo.get():
+            self.needs_team_combo.set(self.overview_team_combo.get())
+            self._show_position_needs()
+
+        self.overview_teams_var.set(str(len(self.dataframes["Teams"])))
+        roster_id = self._selected_roster_id(self.overview_team_combo)
+        week = (self.weekly_state.get("display_week") or self.weekly_state.get("week")
+                or self.weekly_state.get("leg"))
+        self.overview_week_var.set(f"Week {week}" if week else "—")
+
+        roster = self.dataframes["Rosters"]
+        if roster_id is None:
+            self.overview_roster_var.set("—")
+            self.overview_bye_var.set("—")
+            return
+        selected_roster = roster[roster["Roster ID"].astype(str) == str(roster_id)]
+        self.overview_roster_var.set(str(len(selected_roster)))
+        if week and self.weekly_bye_weeks:
+            starters = selected_roster[
+                ~selected_roster["Slot"].astype(str).str.casefold().isin({"bench", "reserve", "ir"})
+            ]
+            bye_count = sum(
+                self.weekly_bye_weeks.get(self._normalize_nfl_team_code(row.get("NFL Team", ""))) == int(week)
+                for _, row in starters.iterrows()
+            )
+            self.overview_bye_var.set(str(bye_count))
+        else:
+            self.overview_bye_var.set("—")
+
+        needs = self.dataframes.get("Position Needs", pd.DataFrame())
+        selected_needs = needs[needs["Roster ID"].astype(str) == str(roster_id)] if not needs.empty else needs
+        for _, row in selected_needs.iterrows():
+            rank, league_size, average, _ranked_count = self._position_quality_for_team(
+                row["Position"], roster_id,
+            )
+            rank_text = self._ordinal_rank(rank, league_size) if rank is not None else "N/A"
+            self.overview_position_tree.insert(
+                "", "end", text=row["Position"],
+                values=(rank_text, f"{average:.1f}" if average is not None else "N/A", row["Rostered"]),
+            )
+
+    def _show_overview_position_rankings(self, position):
+        #List every team in order by average player performance rank for one position.
+        self.overview_rank_position.set(position)
+        for item in self.overview_league_rank_tree.get_children():
+            self.overview_league_rank_tree.delete(item)
+        if self.dataframes is None:
+            return
+
+        quality = self.team_position_quality.get(position, {})
+        rosters = self.dataframes.get("Rosters", pd.DataFrame())
+        team_rows = []
+        for display_name, roster_id in self.team_options:
+            team_roster = rosters[rosters["Roster ID"].astype(str) == str(roster_id)]
+            rostered = 0
+            for _, player in team_roster.iterrows():
+                positions = {
+                    self._position_group(part)
+                    for part in str(player.get("Position", "")).split(",") if part.strip()
+                }
+                if position in positions:
+                    rostered += 1
+            metric = quality.get(str(roster_id))
+            average = metric["average"] if metric else None
+            team_rows.append((display_name, average, rostered))
+
+        ranked = sorted(
+            (row for row in team_rows if row[1] is not None),
+            key=lambda row: (row[1], row[0].casefold()),
+        )
+        rank_by_name = {}
+        previous_average = None
+        current_rank = None
+        for index, (name, average, _rostered) in enumerate(ranked, start=1):
+            if previous_average is None or average != previous_average:
+                current_rank = index
+            rank_by_name[name] = current_rank
+            previous_average = average
+
+        team_rows.sort(key=lambda row: (
+            row[1] is None,
+            row[1] if row[1] is not None else float("inf"),
+            row[0].casefold(),
+        ))
+        for name, average, rostered in team_rows:
+            rank = rank_by_name.get(name)
+            self.overview_league_rank_tree.insert(
+                "", "end",
+                values=(f"#{rank}" if rank is not None else "N/A",
+                        name,
+                        f"{average:.1f}" if average is not None else "N/A",
+                        rostered),
+            )
+
+    @staticmethod
+    def _ordinal_rank(rank, league_size):
+        #Format a numeric place while preserving shared ranks for tied teams.
+        suffix = "th" if 10 <= rank % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(rank % 10, "th")
+        return f"{rank}{suffix} of {league_size}"
+
+    @staticmethod
+    def _position_group(position):
+        #Normalize the player directory's defense aliases to the app's position group.
+        position = str(position or "").strip().upper()
+        return "DEF" if position in {"DST", "D/ST", "DEFENSE"} else position
+
+    @staticmethod
+    def _rank_scores(scores, descending=True):
+        #Return competition ranks, assigning the same place to equal point totals.
+        ordered = sorted(scores.items(), key=lambda item: (-item[1] if descending else item[1], item[0]))
+        ranks = {}
+        previous_score = None
+        current_rank = None
+        for index, (player_id, score) in enumerate(ordered, start=1):
+            if previous_score is None or score != previous_score:
+                current_rank = index
+            ranks[player_id] = current_rank
+            previous_score = score
+        return ranks
+
+    def _position_quality_for_team(self, position, roster_id):
+        #Look up a team's average player rank and its place relative to other teams.
+        team_quality = self.team_position_quality.get(str(position).upper(), {})
+        metric = team_quality.get(str(roster_id))
+        if not metric:
+            return None, len(self.team_options), None, 0
+        average = metric["average"]
+        rank = 1 + sum(other["average"] < average for other in team_quality.values())
+        return rank, len(self.team_options), average, metric["players"]
+
+    def _refresh_player_performance_ranks(self):
+        #Blend each player's completed-season actual and current projected position ranks.
+        self.player_performance_ranks = {}
+        self.team_position_quality = {}
+        if self.dataframes is None:
+            return
+
+        positions_by_player = {}
+        for table_name in ("Rosters", "Free Agents"):
+            table = self.dataframes.get(table_name, pd.DataFrame())
+            if table.empty:
+                continue
+            for _, row in table.iterrows():
+                player_id = str(row.get("Player ID", ""))
+                positions = {
+                    self._position_group(part)
+                    for part in str(row.get("Position", "")).split(",") if part.strip()
+                }
+                positions_by_player.setdefault(player_id, set()).update(positions)
+
+        actual_ranks_by_position = {}
+        projection_ranks_by_position = {}
+        for position in ("QB", "RB", "WR", "TE", "K", "DEF"):
+            actual_scores = {
+                player_id: float(score)
+                for player_id, score in self.season_actual_points.items()
+                if position in positions_by_player.get(str(player_id), set())
+            }
+            projected_scores = {
+                player_id: float(score)
+                for player_id, score in self.roster_projection_values.items()
+                if position in positions_by_player.get(str(player_id), set())
+            }
+            actual_ranks_by_position[position] = self._rank_scores(actual_scores)
+            projection_ranks_by_position[position] = self._rank_scores(projected_scores)
+
+        for position in ("QB", "RB", "WR", "TE", "K", "DEF"):
+            player_ids = set(actual_ranks_by_position[position]) | set(projection_ranks_by_position[position])
+            for player_id in player_ids:
+                source_ranks = [
+                    ranks[player_id]
+                    for ranks in (actual_ranks_by_position[position], projection_ranks_by_position[position])
+                    if player_id in ranks
+                ]
+                self.player_performance_ranks.setdefault(player_id, {})[position] = (
+                    sum(source_ranks) / len(source_ranks)
+                )
+
+        rosters = self.dataframes.get("Rosters", pd.DataFrame())
+        for position in ("QB", "RB", "WR", "TE", "K", "DEF"):
+            team_quality = {}
+            for _team_name, roster_id in self.team_options:
+                team_rows = rosters[rosters["Roster ID"].astype(str) == str(roster_id)]
+                ranks = []
+                for _, row in team_rows.iterrows():
+                    player_id = str(row.get("Player ID", ""))
+                    if position not in positions_by_player.get(player_id, set()):
+                        continue
+                    player_rank = self.player_performance_ranks.get(player_id, {}).get(position)
+                    if player_rank is not None:
+                        ranks.append(player_rank)
+                if ranks:
+                    team_quality[str(roster_id)] = {
+                        "average": sum(ranks) / len(ranks), "players": len(ranks),
+                    }
+            self.team_position_quality[position] = team_quality
+
+        if self.season_actual_points and self.roster_projection_values:
+            note = (
+                "Player ranks equally average completed-season actual points-per-game rank and current-week "
+                "projection rank; team rank averages its rostered players' ranks. Lower is stronger."
+            )
+        elif self.season_actual_points and self.roster_projections_loaded:
+            note = (
+                "Current-week projections are unavailable; ranks use completed-season actual points per game. "
+                "Lower player and team averages are stronger."
+            )
+        elif self.roster_projection_values and self.season_actuals_loaded:
+            note = (
+                "Season actuals are unavailable; ranks use current-week projected points. "
+                "Lower player and team averages are stronger."
+            )
+        elif self.season_actual_points:
+            note = "Using completed-season actual points per game while current-week projections load."
+        elif self.roster_projection_values:
+            note = "Using current-week projections while completed-season actuals load."
+        elif not self.season_actuals_loaded or not self.roster_projections_loaded:
+            note = "Loading completed-season actuals and current-week projections for player ranks…"
+        else:
+            details = []
+            if self.season_actual_error:
+                details.append("season actuals unavailable")
+            if self.roster_projection_error:
+                details.append("weekly projections unavailable")
+            note = "Performance-based ranks are unavailable" + (
+                f" ({'; '.join(details)})." if details else " until Sleeper publishes actuals or projections."
+            )
+        if self.season_actual_points or self.roster_projection_values:
+            note += " Points use the nearest Standard, Half-PPR, or PPR preset; custom scoring bonuses aren't included."
+        self.performance_rank_note_var.set(note)
+        self._show_position_needs()
+        self._refresh_league_overview()
+
     def _show_position_needs(self, _event=None):
-        #Fill the depth table for the selected team and summarize the likely thin spots.
+        #Fill the selected team's positional needs and performance-based league rank.
         if self.dataframes is None:
             return
         roster_id = self._selected_roster_id(self.needs_team_combo)
@@ -296,7 +628,13 @@ class TradeFeatures:
         selected = needs[needs["Roster ID"].astype(str) == str(roster_id)]
         gaps = []
         for _, row in selected.iterrows():
+            position_rank, league_size, average, ranked_players = self._position_quality_for_team(
+                row["Position"], roster_id,
+            )
             self.needs_tree.insert("", "end", text=row["Position"], values=(
+                self._ordinal_rank(position_rank, league_size) if position_rank is not None else "N/A",
+                f"{average:.1f}" if average is not None else "N/A",
+                f"{ranked_players}/{int(row['Rostered'])}",
                 row["Required"], row["Starting"], row["Rostered"], row["Bench"], row["Assessment"]
             ))
             if row["Starting"] < row["Required"]:
@@ -304,8 +642,12 @@ class TradeFeatures:
             elif row["Position"] not in {"K", "DEF"} and row["Rostered"] <= row["Required"]:
                 gaps.append(f'{row["Position"]} depth')
         self.needs_summary_var.set(
-            "Potential needs: " + (", ".join(gaps) if gaps else "No obvious positional gaps by roster counts.")
+            "Potential needs by starter and depth counts: "
+            + (", ".join(gaps) if gaps else "No obvious positional gaps by roster counts.")
         )
+        if self.overview_team_combo.get() != self.needs_team_combo.get():
+            self.overview_team_combo.set(self.needs_team_combo.get())
+            self._refresh_league_overview()
 
     def _populate_trade_rosters(self, _event=None):
         #Refresh only the list whose team changed so the other side's selection stays selected.
