@@ -1,10 +1,5 @@
-Added more data
+Minor Tweaks & Trade Targets Overhaul
 
-- Weekly Help now shows projected points for Free Agents
-- Added Flex and Super Flex filter to Weekly Help
-- Added League Overview tab that shows your positional ranks compared to the rest of the league.
-	- Also shows the rankings of other teams (1->n, where n=total number of teams in your league)
--TODO:
-	- Overhaul Trade Targets to allow you to select specific player(s) you're interested in and help you build trades.
-	- Add more analytical tools
-	- Deploy web version via GitHub pages to make the program more accessible
+- Trade Targets allow you to select player(s) from a team you'd like to acquire and show you packages from your own team with a similar value
+- Value Trends now defaults to the Value Metric instead of Percent Change
+- Removed "Copy Notes" button from Main Menu/Release Notes since text is now highlightable

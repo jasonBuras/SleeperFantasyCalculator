@@ -28,7 +28,7 @@ from openpyxl.utils import get_column_letter
 
 #This URL is the root used by Sleeper's read-only API.
 BASE_URL = "https://api.sleeper.app/v1"
-APP_VERSION = "1.1.6"
+APP_VERSION = "1.1.7"
 GITHUB_RELEASE_API = "https://api.github.com/repos/jasonBuras/SleeperFantasyCalculator/releases/latest"
 UPDATE_ASSET_NAME = "FantasyTradeCalculator-Windows.zip"
 

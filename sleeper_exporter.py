@@ -38,7 +38,7 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
         self.trade_history_series = []
         self.trade_history_signature = None
         self.trade_history_request_id = 0
-        self.trade_history_metric_var = tk.StringVar(value="Percent Change")
+        self.trade_history_metric_var = tk.StringVar(value="Value")
         self.trade_history_plot_points = {}
         self.trade_history_window = None
         self.trade_history_popup_canvas = None
@@ -321,13 +321,6 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
         self.update_notes_text.delete("1.0", "end")
         self.update_notes_text.insert("1.0", str(notes or ""))
         self.update_notes_text.configure(state="disabled")
-
-    def _copy_update_notes(self):
-        #Copy the complete plain-text release notes to the clipboard.
-        notes = self.update_notes_text.get("1.0", "end-1c")
-        if notes.strip():
-            self.clipboard_clear()
-            self.clipboard_append(notes)
 
     def _open_update_release_page(self, _event=None):
         #Only open release links hosted in this project's GitHub Releases page.
@@ -616,7 +609,6 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
         self.update_notes_text.configure(yscrollcommand=notes_scroll.set)
         self.update_notes_text.pack(side="left", fill="both", expand=True)
         notes_scroll.pack(side="right", fill="y")
-        ttk.Button(notes_frame, text="Copy Notes", command=self._copy_update_notes).pack(side="right", padx=(6, 0))
         self._set_update_notes(self.update_notes_var.get())
 
         #League Overview provides a compact landing page and shortcuts into common tasks.
@@ -1211,11 +1203,11 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
         ttk.Button(saved_actions, text="Import Trades", command=self._import_saved_trades).pack(side="right", padx=(0, 8))
         ttk.Button(saved_actions, text="Export Trades", command=self._export_saved_trades).pack(side="right", padx=(0, 8))
 
-        #Trade Targets lists bench-player one-for-one ideas based on reciprocal position needs.
+        #Trade Targets starts from desired players and suggests offers from your roster.
         ideas_tab = ttk.Frame(self.workspace, padding=12)
         self.workspace.add(ideas_tab, text="Trade Targets")
-        ttk.Label(ideas_tab, text="Potential trade partners based on reciprocal roster needs.", font=("TkDefaultFont", 11, "bold")).pack(anchor="w")
-        ttk.Label(ideas_tab, text="Suggestions focus on bench depth and market values. They are starting points, not predictions that another manager will accept.", wraplength=900).pack(anchor="w", pady=(3, 8))
+        ttk.Label(ideas_tab, text="Build offers around the player(s) you want.", font=("TkDefaultFont", 11, "bold")).pack(anchor="w")
+        ttk.Label(ideas_tab, text="Choose a trade partner and target players. Suggested offers use FantasyCalc market values and roster needs as a guide.", wraplength=1000).pack(anchor="w", pady=(3, 8))
         ideas_credit = ttk.Label(ideas_tab, text="Trade values provided by FantasyCalc · fantasycalc.com", foreground="#1f5a92", cursor="hand2")
         self.attribution_labels.append(ideas_credit)
         ideas_credit.pack(anchor="w", pady=(0, 6))
@@ -1223,40 +1215,109 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
         ideas_controls = ttk.Frame(ideas_tab)
         ideas_controls.pack(fill="x", pady=(0, 8))
         ttk.Label(ideas_controls, text="Your team:").pack(side="left")
-        self.suggestion_team_combo = ttk.Combobox(ideas_controls, state="readonly", width=38)
-        self.suggestion_team_combo.pack(side="left", padx=8)
-        self.suggestion_team_combo.bind("<<ComboboxSelected>>", self._refresh_trade_ideas)
-        ttk.Button(ideas_controls, text="Review Selected Idea", command=self._open_selected_trade_idea).pack(side="right")
-        ideas_list = ttk.Frame(ideas_tab)
-        ideas_list.pack(fill="both", expand=True)
-        self.trade_ideas_tree = ttk.Treeview(
-            ideas_list,
-            columns=("match", "offer", "offer_value", "target", "target_value", "fit"),
-            show="tree headings", selectmode="browse", height=8,
+        self.trade_target_own_team_combo = ttk.Combobox(ideas_controls, state="readonly", width=30)
+        self.trade_target_own_team_combo.pack(side="left", padx=(8, 14))
+        self.trade_target_own_team_combo.bind("<<ComboboxSelected>>", self._trade_target_team_changed)
+        ttk.Label(ideas_controls, text="Trade with:").pack(side="left")
+        self.trade_target_partner_combo = ttk.Combobox(ideas_controls, state="readonly", width=30)
+        self.trade_target_partner_combo.pack(side="left", padx=8)
+        self.trade_target_partner_combo.bind("<<ComboboxSelected>>", self._refresh_trade_target_players)
+        ttk.Label(ideas_controls, text="Max value gap:").pack(side="left", padx=(8, 0))
+        self.trade_target_tolerance_var = tk.StringVar(value="15%")
+        self.trade_target_tolerance_combo = ttk.Combobox(
+            ideas_controls, textvariable=self.trade_target_tolerance_var,
+            values=("5%", "10%", "15%", "20%", "25%", "35%"),
+            state="readonly", width=7,
         )
-        self.trade_ideas_tree.heading("#0", text="Trade Partner")
-        for key, label in (("match", "Position Fit"), ("offer", "You Could Offer"),
-                           ("offer_value", "Value"), ("target", "Ask About"),
-                           ("target_value", "Value"), ("fit", "Market Fit")):
-            self.trade_ideas_tree.heading(key, text=label)
-        self.trade_ideas_tree.column("#0", width=165)
-        self.trade_ideas_tree.column("match", width=190)
-        self.trade_ideas_tree.column("offer", width=190)
-        self.trade_ideas_tree.column("offer_value", width=85, anchor="e")
-        self.trade_ideas_tree.column("target", width=190)
-        self.trade_ideas_tree.column("target_value", width=85, anchor="e")
-        self.trade_ideas_tree.column("fit", width=110)
-        self._add_tree_expand_controls(ideas_controls, self.trade_ideas_tree)
-        ideas_scroll = ttk.Scrollbar(ideas_list, orient="vertical", command=self.trade_ideas_tree.yview)
-        ideas_xscroll = ttk.Scrollbar(ideas_list, orient="horizontal", command=self.trade_ideas_tree.xview)
-        self.trade_ideas_tree.configure(yscrollcommand=ideas_scroll.set, xscrollcommand=ideas_xscroll.set)
-        self.trade_ideas_tree.pack(side="left", fill="both", expand=True)
-        ideas_scroll.pack(side="right", fill="y")
-        ideas_xscroll.pack(side="bottom", fill="x")
-        self.trade_ideas_tree.bind("<Double-1>", lambda _event: self._open_selected_trade_idea())
-        self.trade_ideas_summary = tk.StringVar(value="Load a league to find possible trade fits.")
-        ttk.Label(ideas_tab, textvariable=self.trade_ideas_summary, wraplength=900).pack(anchor="w", pady=(8, 0))
-        self.trade_ideas_by_id = {}
+        self.trade_target_tolerance_combo.pack(side="left", padx=(6, 0))
+        self.trade_target_tolerance_combo.bind("<<ComboboxSelected>>", self._refresh_trade_target_offers)
+        target_content = ttk.PanedWindow(ideas_tab, orient="horizontal")
+        target_content.pack(fill="both", expand=True)
+        target_box = ttk.LabelFrame(target_content, text="Players You Want", padding=6)
+        target_offers_box = ttk.LabelFrame(target_content, text="Possible Offers from Your Team", padding=6)
+        target_content.add(target_box, weight=1)
+        target_content.add(target_offers_box, weight=2)
+        target_search = ttk.Frame(target_box)
+        target_search.pack(fill="x", pady=(0, 5))
+        ttk.Label(target_search, text="Search:").pack(side="left")
+        self.trade_target_search_var = tk.StringVar()
+        ttk.Entry(target_search, textvariable=self.trade_target_search_var).pack(
+            side="left", fill="x", expand=True, padx=(6, 0),
+        )
+        target_player_list = ttk.Frame(target_box)
+        target_player_list.pack(fill="both", expand=True)
+        self.trade_target_players_tree = ttk.Treeview(
+            target_player_list, columns=("position", "value"), show="tree headings",
+            selectmode="extended", height=10,
+        )
+        self.trade_target_players_tree.heading("#0", text="Player")
+        self.trade_target_players_tree.heading("position", text="Position")
+        self.trade_target_players_tree.heading("value", text="FC Value")
+        self.trade_target_players_tree.column("#0", width=175)
+        self.trade_target_players_tree.column("position", width=75, anchor="center")
+        self.trade_target_players_tree.column("value", width=80, anchor="e")
+        target_player_scroll = ttk.Scrollbar(target_player_list, orient="vertical", command=self.trade_target_players_tree.yview)
+        self.trade_target_players_tree.configure(yscrollcommand=target_player_scroll.set)
+        self.trade_target_players_tree.pack(side="left", fill="both", expand=True)
+        target_player_scroll.pack(side="right", fill="y")
+        self.trade_target_players_tree.bind("<<TreeviewSelect>>", self._refresh_trade_target_offers)
+        self.trade_target_search_var.trace_add("write", lambda *_: self._filter_trade_target_players())
+        self.trade_target_player_ids = []
+        self.trade_target_selection_var = tk.StringVar(value="Select the player(s) you want to receive.")
+        ttk.Label(target_box, textvariable=self.trade_target_selection_var, wraplength=360).pack(anchor="w", pady=(5, 0))
+        target_offer_filters = ttk.Frame(target_offers_box)
+        target_offer_filters.pack(fill="x", pady=(0, 5))
+        ttk.Label(target_offer_filters, text="Offer position:").pack(side="left")
+        self.trade_target_position_filter = ttk.Combobox(
+            target_offer_filters, state="readonly", width=9, values=("Any",),
+        )
+        self.trade_target_position_filter.set("Any")
+        self.trade_target_position_filter.pack(side="left", padx=(5, 12))
+        self.trade_target_position_filter.bind("<<ComboboxSelected>>", self._filter_trade_target_offers)
+        ttk.Label(target_offer_filters, text="Players sent:").pack(side="left")
+        self.trade_target_package_size_filter = ttk.Combobox(
+            target_offer_filters, state="readonly", width=9, values=("Any", "1", "2", "3"),
+        )
+        self.trade_target_package_size_filter.set("Any")
+        self.trade_target_package_size_filter.pack(side="left", padx=(5, 0))
+        self.trade_target_package_size_filter.bind("<<ComboboxSelected>>", self._filter_trade_target_offers)
+        ttk.Button(
+            target_offer_filters, text="Reset Filters", command=self._reset_trade_target_filters,
+        ).pack(side="left", padx=(10, 0))
+        target_offer_list = ttk.Frame(target_offers_box)
+        target_offer_list.pack(fill="both", expand=True)
+        self.trade_target_offers_tree = ttk.Treeview(
+            target_offer_list,
+            columns=("offer", "positions", "offer_value", "target_value", "gap", "fit"),
+            show="headings", selectmode="browse", height=10,
+        )
+        for key, label in (("offer", "You Send"), ("positions", "Positions"),
+                           ("offer_value", "Offer Value"), ("target_value", "Target Value"),
+                           ("gap", "Value Gap"), ("fit", "Roster Fit")):
+            self.trade_target_offers_tree.heading(key, text=label)
+        self.trade_target_offers_tree.column("offer", width=280)
+        self.trade_target_offers_tree.column("positions", width=100, anchor="center")
+        for key in ("offer_value", "target_value", "gap"):
+            self.trade_target_offers_tree.column(key, width=100, anchor="e")
+        self.trade_target_offers_tree.column("fit", width=100, anchor="center")
+        target_offer_scroll = ttk.Scrollbar(target_offer_list, orient="vertical", command=self.trade_target_offers_tree.yview)
+        target_offer_xscroll = ttk.Scrollbar(target_offer_list, orient="horizontal", command=self.trade_target_offers_tree.xview)
+        self.trade_target_offers_tree.configure(
+            yscrollcommand=target_offer_scroll.set, xscrollcommand=target_offer_xscroll.set,
+        )
+        self.trade_target_offers_tree.pack(side="left", fill="both", expand=True)
+        target_offer_scroll.pack(side="right", fill="y")
+        target_offer_xscroll.pack(side="bottom", fill="x")
+        self.trade_target_offers_tree.bind("<Double-1>", lambda _event: self._open_trade_target_offer())
+        self.trade_target_summary = tk.StringVar(value="Choose a partner and target player(s) to build offers.")
+        target_actions = ttk.Frame(target_offers_box)
+        target_actions.pack(fill="x", pady=(5, 0))
+        ttk.Label(target_actions, textvariable=self.trade_target_summary, wraplength=700).pack(
+            side="left", fill="x", expand=True,
+        )
+        ttk.Button(target_actions, text="Review Selected Offer", command=self._open_trade_target_offer).pack(side="right")
+        self.trade_target_matches = {}
+        self.trade_target_all_matches = []
 
         #Trade Builder finds near-even player packages across every opposing roster.
         builder_tab = ttk.Frame(self.workspace, padding=12)
@@ -1540,7 +1601,8 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
         options = [display for display, _roster_id in self.team_options]
         self.overview_team_combo["values"] = options
         self.needs_team_combo["values"] = options
-        self.suggestion_team_combo["values"] = options
+        self.trade_target_own_team_combo["values"] = options
+        self.trade_target_partner_combo["values"] = options
         self.weekly_team_combo["values"] = options
         self.roster_team_combo["values"] = options
         self.value_trend_team_combo["values"] = ["All League Players"] + options
@@ -1557,7 +1619,7 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
         if options:
             self.overview_team_combo.current(default_index)
             self.needs_team_combo.current(default_index)
-            self.suggestion_team_combo.current(default_index)
+            self.trade_target_own_team_combo.current(default_index)
             self.weekly_team_combo.current(default_index)
             self.roster_team_combo.current(default_index)
             self.value_trend_team_combo.current(0)
@@ -1565,6 +1627,7 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
             self.trade_left_team.current(default_index)
             other_index = 1 if len(options) > 1 and default_index == 0 else 0
             self.trade_right_team.current(other_index)
+            self.trade_target_partner_combo.current(other_index)
         self._show_position_needs()
         self.weekly_state = {}
         self.weekly_matchups = []
@@ -1593,7 +1656,7 @@ class App(TradeFeatures, InsightsFeatures, tk.Tk):
         self._refresh_league_overview()
         self._refresh_roster_view()
         self._refresh_value_trends()
-        self._refresh_trade_ideas()
+        self._trade_target_team_changed()
         self._trade_builder_team_changed()
         self._populate_trade_rosters()
         self._refresh_saved_trades_view()

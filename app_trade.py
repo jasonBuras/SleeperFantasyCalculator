@@ -1443,6 +1443,10 @@ class TradeFeatures:
         match = self.trade_builder_matches.get(selection[0])
         if not match:
             return
+        self._load_trade_match(match, "Trade Builder suggestion")
+
+    def _load_trade_match(self, match, source):
+        #Load either builder's suggested package into the standard trade review.
         left_index = next((index for index, (_label, roster_id) in enumerate(self.team_options)
                            if str(roster_id) == match["own_roster_id"]), None)
         right_index = next((index for index, (_label, roster_id) in enumerate(self.team_options)
@@ -1462,165 +1466,264 @@ class TradeFeatures:
                 tags = trade_tree.item(iid, "tags")
                 if tags and str(tags[0]) in player_ids:
                     trade_tree.selection_add(iid)
-        self.trade_note_var.set(f"Trade Builder suggestion · {match['partner']} · {match['gap']:.0%} value gap")
+        self.trade_note_var.set(f"{source} · {match['partner']} · {match['gap']:.0%} value gap")
         self.workspace.select(self.trade_tab)
         self._update_trade_review()
 
-    def _refresh_trade_ideas(self, _event=None):
-        #Find reciprocal depth fits and rank candidate one-for-one deals by value gap.
-        if self.dataframes is None or not hasattr(self, "trade_ideas_tree"):
+    def _trade_target_team_changed(self, _event=None):
+        #Offer only opposing rosters as targets for the selected team.
+        own_roster_id = self._selected_roster_id(self.trade_target_own_team_combo)
+        options = [name for name, roster_id in self.team_options
+                   if str(roster_id) != str(own_roster_id)]
+        current = self.trade_target_partner_combo.get()
+        self.trade_target_partner_combo.configure(values=options)
+        if current not in options:
+            self.trade_target_partner_combo.set(options[0] if options else "")
+        self._refresh_trade_target_players()
+
+    def _refresh_trade_target_players(self, _event=None):
+        #Populate the selected partner's roster while retaining still-valid target selections.
+        if not hasattr(self, "trade_target_players_tree"):
             return
-        for item in self.trade_ideas_tree.get_children():
-            self.trade_ideas_tree.delete(item)
-        self.trade_ideas_by_id.clear()
-        own_roster_id = self._selected_roster_id(self.suggestion_team_combo)
-        if own_roster_id is None:
-            self.trade_ideas_summary.set("Choose your team to find potential trade fits.")
+        selected_before = set(self.trade_target_players_tree.selection())
+        self._loading_trade_targets = True
+        for item in self.trade_target_players_tree.get_children():
+            self.trade_target_players_tree.delete(item)
+        self.trade_target_player_ids = []
+        if self.dataframes is None:
+            self._loading_trade_targets = False
+            self.trade_target_selection_var.set("Load a league to choose target players.")
+            return
+        partner_roster_id = self._selected_roster_id(self.trade_target_partner_combo)
+        if partner_roster_id is None:
+            self._loading_trade_targets = False
+            self.trade_target_selection_var.set("Choose another league team to see its players.")
+            return
+
+        own_roster_id = self._selected_roster_id(self.trade_target_own_team_combo)
+        if str(partner_roster_id) == str(own_roster_id):
+            self._loading_trade_targets = False
+            self.trade_target_selection_var.set("Choose a different team as your trade partner.")
+            return
+        partner = self.dataframes["Rosters"]
+        partner = partner[partner["Roster ID"].astype(str) == str(partner_roster_id)]
+        ordered = sorted(partner.iterrows(), key=lambda item: (
+            str(item[1].get("Player", "")).casefold(),
+        ))
+        for _, row in ordered:
+            player_id = str(row["Player ID"])
+            value = self.fantasycalc_values.get(player_id)
+            self.trade_target_players_tree.insert(
+                "", "end", iid=player_id, text=str(row["Player"]), tags=(player_id,),
+                values=(row.get("Position", ""), f"{value:,.0f}" if value is not None else "N/A"),
+            )
+            self.trade_target_player_ids.append(player_id)
+            if player_id in selected_before:
+                self.trade_target_players_tree.selection_add(player_id)
+        self._loading_trade_targets = False
+        self._filter_trade_target_players()
+        self._refresh_trade_target_offers()
+
+    def _filter_trade_target_players(self):
+        #Filter the opposing roster without clearing multi-player target selections.
+        if not hasattr(self, "trade_target_players_tree"):
+            return
+        query = self.trade_target_search_var.get().strip().casefold()
+        for player_id in self.trade_target_player_ids:
+            if not self.trade_target_players_tree.exists(player_id):
+                continue
+            row = self.trade_target_players_tree.item(player_id)
+            searchable = " ".join((str(row.get("text", "")), *(str(value) for value in row.get("values", ())))).casefold()
+            if not query or query in searchable:
+                self.trade_target_players_tree.move(player_id, "", "end")
+            else:
+                self.trade_target_players_tree.detach(player_id)
+
+    def _refresh_trade_target_offers(self, _event=None):
+        #Find one-to-three-player offers from your roster near the selected target value.
+        if getattr(self, "_loading_trade_targets", False) or not hasattr(self, "trade_target_offers_tree"):
+            return
+        for item in self.trade_target_offers_tree.get_children():
+            self.trade_target_offers_tree.delete(item)
+        self.trade_target_matches = {}
+        self.trade_target_all_matches = []
+        selected_targets = self.trade_target_players_tree.selection()
+        own_roster_id = self._selected_roster_id(self.trade_target_own_team_combo)
+        partner_roster_id = self._selected_roster_id(self.trade_target_partner_combo)
+        if self.dataframes is None or own_roster_id is None or partner_roster_id is None:
+            self.trade_target_selection_var.set("Choose your team and a trade partner.")
+            self.trade_target_summary.set("Choose a partner and target player(s) to build offers.")
+            return
+        if not selected_targets:
+            self.trade_target_selection_var.set("Select the player(s) you want to receive.")
+            self.trade_target_summary.set("Select one or more players on the partner roster to see possible offers.")
+            return
+        roster_data = self.dataframes["Rosters"]
+        partner_rows = roster_data[
+            (roster_data["Roster ID"].astype(str) == str(partner_roster_id)) &
+            (roster_data["Player ID"].astype(str).isin({str(pid) for pid in selected_targets}))
+        ]
+        target_assets = []
+        missing_targets = []
+        for _, player in partner_rows.iterrows():
+            player_id = str(player["Player ID"])
+            value = self.fantasycalc_values.get(player_id)
+            if value is None or value <= 0:
+                missing_targets.append(str(player["Player"]))
+                continue
+            target_assets.append({
+                "id": player_id, "name": str(player["Player"]),
+                "position": str(player["Position"]), "value": value,
+            })
+        if missing_targets:
+            self.trade_target_selection_var.set(
+                f"{len(target_assets)} target(s) selected · value unavailable for "
+                f"{len(missing_targets)} player(s)."
+            )
+        else:
+            self.trade_target_selection_var.set(
+                f"{len(target_assets)} target(s) selected · total FC value "
+                f"{sum(asset['value'] for asset in target_assets):,.0f}."
+            )
+        if missing_targets:
+            self.trade_target_summary.set("Waiting for FantasyCalc values for every selected target.")
+            return
+        if not target_assets:
+            self.trade_target_summary.set("Wait for target player FantasyCalc values to load.")
+            return
+
+        target_value = sum(asset["value"] for asset in target_assets)
+        try:
+            tolerance = float(self.trade_target_tolerance_var.get().rstrip("%")) / 100
+        except (TypeError, ValueError):
+            tolerance = 0.15
+        own_rows = roster_data[roster_data["Roster ID"].astype(str) == str(own_roster_id)]
+        candidates = []
+        for _, player in own_rows.iterrows():
+            player_id = str(player["Player ID"])
+            value = self.fantasycalc_values.get(player_id)
+            if value is not None and value > 0:
+                candidates.append({
+                    "id": player_id, "name": str(player["Player"]),
+                    "position": str(player["Position"]), "value": value,
+                })
+        if not candidates:
+            self.trade_target_summary.set("Your roster has no players with a positive FantasyCalc value.")
             return
 
         needs_data = self.dataframes.get("Position Needs", pd.DataFrame())
-        roster_data = self.dataframes["Rosters"]
-        relevant_positions = {"QB", "RB", "WR", "TE"}
-        if needs_data.empty or "Roster ID" not in needs_data.columns:
-            self.trade_ideas_summary.set("No lineup position requirements were found for this league.")
-            return
+        def needs_for(roster_id):
+            if needs_data.empty or "Roster ID" not in needs_data:
+                return set()
+            team_needs = needs_data[needs_data["Roster ID"].astype(str) == str(roster_id)]
+            return {self._position_group(row["Position"]) for _, row in team_needs.iterrows()
+                    if str(row.get("Assessment", "")) != "Covered"}
 
-        #A need is a position currently flagged as a starter gap or thin roster depth.
-        def team_needs(roster_id):
-            frame = needs_data[needs_data["Roster ID"].astype(str) == str(roster_id)]
-            return {str(row["Position"]) for _, row in frame.iterrows()
-                    if row["Position"] in relevant_positions and row["Assessment"] != "Covered"}
+        own_needs = needs_for(own_roster_id)
+        partner_needs = needs_for(partner_roster_id)
+        target_positions = {self._position_group(part) for asset in target_assets
+                            for part in asset["position"].split(",") if part.strip()}
+        matches = []
+        for count in range(1, min(3, len(candidates)) + 1):
+            for package in itertools.combinations(candidates, count):
+                offer_value = sum(asset["value"] for asset in package)
+                gap = abs(offer_value - target_value) / max(offer_value, target_value)
+                if gap > tolerance:
+                    continue
+                offer_positions = {self._position_group(part) for asset in package
+                                   for part in asset["position"].split(",") if part.strip()}
+                offer_fit = bool(offer_positions & partner_needs)
+                target_fit = bool(target_positions & own_needs)
+                if offer_fit and target_fit:
+                    fit, fit_order = "Both sides", 0
+                elif offer_fit or target_fit:
+                    fit, fit_order = "One side", 1
+                else:
+                    fit, fit_order = "Value only", 2
+                matches.append({
+                    "id": uuid.uuid4().hex,
+                    "partner": self.trade_target_partner_combo.get(),
+                    "partner_roster_id": str(partner_roster_id),
+                    "own_roster_id": str(own_roster_id),
+                    "give_assets": list(package), "receive_assets": target_assets,
+                    "give_value": offer_value, "receive_value": target_value,
+                    "gap": gap, "fit": fit, "fit_order": fit_order,
+                })
+        matches.sort(key=lambda match: (
+            match["gap"], match["fit_order"], len(match["give_assets"]),
+            "+".join(asset["name"] for asset in match["give_assets"]).casefold(),
+        ))
+        self.trade_target_all_matches = matches
+        self.trade_target_search_context = {
+            "tolerance": tolerance, "target_value": target_value,
+            "targets": [asset["name"] for asset in target_assets],
+        }
+        offer_assets = [asset for match in matches for asset in match["give_assets"]]
+        positions = sorted({self._position_group(position) for asset in offer_assets
+                            for position in asset["position"].split(",") if position.strip()})
+        self._set_trade_builder_filter_values(self.trade_target_position_filter, positions)
+        self._filter_trade_target_offers()
 
-        #A surplus is an extra rostered player beyond the required starter count.
-        def team_surplus(roster_id):
-            frame = needs_data[needs_data["Roster ID"].astype(str) == str(roster_id)]
-            return {str(row["Position"]) for _, row in frame.iterrows()
-                    if row["Position"] in relevant_positions and row["Rostered"] > row["Required"]}
-
-        #Only suggest bench assets so the app does not immediately recommend trading starters.
-        def bench_assets(roster_id, position):
-            frame = roster_data[
-                (roster_data["Roster ID"].astype(str) == str(roster_id)) &
-                (roster_data["Slot"].astype(str).str.casefold() == "bench")
-            ]
-            assets = []
-            for _, player in frame.iterrows():
-                eligible = {part.strip().upper() for part in str(player["Position"]).split(",")}
-                if position in eligible:
-                    player_id = str(player["Player ID"])
-                    assets.append({
-                        "id": player_id,
-                        "name": str(player["Player"]),
-                        "position": str(player["Position"]),
-                        "value": self.fantasycalc_values.get(player_id),
-                    })
-            return sorted(assets, key=lambda asset: (asset["value"] is None, -(asset["value"] or 0), asset["name"].casefold()))[:5]
-
-        our_needs = team_needs(own_roster_id)
-        our_surplus = team_surplus(own_roster_id)
-        ideas = []
-        for partner_label, partner_roster_id in self.team_options:
-            if str(partner_roster_id) == str(own_roster_id):
+    def _filter_trade_target_offers(self, _event=None):
+        #Filter target-driven suggestions by offer position and package size.
+        tree = self.trade_target_offers_tree
+        for item in tree.get_children():
+            tree.delete(item)
+        self.trade_target_matches = {}
+        position = self.trade_target_position_filter.get()
+        package_size = self.trade_target_package_size_filter.get()
+        filtered = []
+        for match in self.trade_target_all_matches:
+            package = match["give_assets"]
+            if package_size != "Any" and len(package) != int(package_size):
                 continue
-            their_needs = team_needs(partner_roster_id)
-            their_surplus = team_surplus(partner_roster_id)
-            offer_positions = sorted(our_surplus & their_needs)
-            target_positions = sorted(our_needs & their_surplus)
-            for offer_position in offer_positions:
-                offers = bench_assets(own_roster_id, offer_position)
-                for target_position in target_positions:
-                    targets = bench_assets(partner_roster_id, target_position)
-                    for offer in offers:
-                        for target in targets:
-                            offer_value = offer["value"]
-                            target_value = target["value"]
-                            gap = None
-                            if offer_value is not None and target_value is not None:
-                                denominator = max(offer_value, target_value)
-                                gap = abs(offer_value - target_value) / denominator if denominator else 0
-                            if gap is None:
-                                market_fit = "Values unavailable"
-                            elif gap <= 0.10:
-                                market_fit = "Close"
-                            elif gap <= 0.25:
-                                market_fit = "Some gap"
-                            else:
-                                market_fit = "Large gap"
-                            ideas.append({
-                                "partner": partner_label,
-                                "partner_roster_id": partner_roster_id,
-                                "offer_roster_id": own_roster_id,
-                                "offer": offer,
-                                "target": target,
-                                "match": f"They need {offer_position} · You need {target_position}",
-                                "gap": gap,
-                                "market_fit": market_fit,
-                            })
-
-        ideas.sort(key=lambda idea: (idea["gap"] is None,
-                                    idea["gap"] if idea["gap"] is not None else 1,
-                                    idea["partner"].casefold(),
-                                    idea["offer"]["name"].casefold()))
-        partner_groups = {}
-        for idea in ideas[:100]:
-            item_id = uuid.uuid4().hex
-            offer_value = idea["offer"]["value"]
-            target_value = idea["target"]["value"]
-            group_id = partner_groups.get(idea["partner"])
-            if group_id is None:
-                group_id = f"trade-partner-{len(partner_groups)}"
-                partner_groups[idea["partner"]] = group_id
-                self.trade_ideas_tree.insert(
-                    "", "end", iid=group_id, text=idea["partner"], open=True,
-                    values=("", "", "", "", "", ""), tags=("partner",),
-                )
-            self.trade_ideas_tree.insert(
-                group_id, "end", iid=item_id,
-                text=f"{idea['offer']['name']} for {idea['target']['name']}",
-                values=(idea["match"], idea["offer"]["name"],
-                        f"{offer_value:,.0f}" if offer_value is not None else "N/A",
-                        idea["target"]["name"],
-                        f"{target_value:,.0f}" if target_value is not None else "N/A",
-                        idea["market_fit"]),
+            if position != "Any" and not any(
+                    position.upper() in {self._position_group(part) for part in asset["position"].split(",")}
+                    for asset in package):
+                continue
+            filtered.append(match)
+        for match in filtered[:200]:
+            iid = match["id"]
+            self.trade_target_offers_tree.insert(
+                "", "end", iid=iid,
+                values=(" + ".join(asset["name"] for asset in match["give_assets"]),
+                        " + ".join(asset["position"] for asset in match["give_assets"]),
+                        f"{match['give_value']:,.0f}", f"{match['receive_value']:,.0f}",
+                        f"{match['give_value'] - match['receive_value']:+,.0f} ({match['gap']:.0%})",
+                        match["fit"]),
             )
-            self.trade_ideas_by_id[item_id] = idea
-        self.trade_ideas_summary.set(
-            f"Showing {min(len(ideas), 100)} potential one-for-one fit(s) across {len(partner_groups)} team(s). "
-            "Open an idea to adjust it and review the full trade."
-            if ideas else
-            "No reciprocal bench-depth fits found. Check position needs or try a different team."
-        )
+            self.trade_target_matches[iid] = match
+        context = getattr(self, "trade_target_search_context", {})
+        targets = ", ".join(context.get("targets", []))
+        if filtered:
+            self.trade_target_summary.set(
+                f"Showing {min(len(filtered), 200)} of {len(filtered)} offer(s) for {targets} "
+                f"within {context.get('tolerance', 0.15):.0%} of target value "
+                f"{context.get('target_value', 0):,.0f}. Double-click an offer to review it."
+            )
+        elif context:
+            self.trade_target_summary.set(
+                f"No offers for {targets} fall within {context.get('tolerance', 0.15):.0%} of target value. "
+                "Try widening the value gap."
+            )
+        else:
+            self.trade_target_summary.set("Select target player(s) to build offers.")
 
-    def _open_selected_trade_idea(self):
-        #Load a selected idea into Trade Review so the user can adjust it before saving.
-        selection = self.trade_ideas_tree.selection()
+    def _reset_trade_target_filters(self):
+        #Restore target-offer filters and show every matching package.
+        self.trade_target_position_filter.set("Any")
+        self.trade_target_package_size_filter.set("Any")
+        self._filter_trade_target_offers()
+
+    def _open_trade_target_offer(self):
+        #Open the selected target-driven package in the detailed trade review.
+        selection = self.trade_target_offers_tree.selection()
         if not selection:
-            messagebox.showinfo("Choose an Idea", "Select a trade idea to open in Trade Review.")
+            messagebox.showinfo("Choose an Offer", "Select a suggested offer first.")
             return
-        idea = self.trade_ideas_by_id.get(selection[0])
-        if not idea:
-            return
-        left_index = next((i for i, (_label, roster_id) in enumerate(self.team_options)
-                           if str(roster_id) == str(idea["offer_roster_id"])), None)
-        right_index = next((i for i, (_label, roster_id) in enumerate(self.team_options)
-                            if str(roster_id) == str(idea["partner_roster_id"])), None)
-        if left_index is None or right_index is None:
-            return
-        self._new_trade()
-        self.trade_left_team.current(left_index)
-        self.trade_right_team.current(right_index)
-        self._populate_trade_rosters()
-        for tree, player_id in ((self.trade_left_tree, idea["offer"]["id"]),
-                                (self.trade_right_tree, idea["target"]["id"])):
-            for iid in tree.get_children():
-                tags = tree.item(iid, "tags")
-                if tags and str(tags[0]) == str(player_id):
-                    tree.selection_add(iid)
-                    tree.see(iid)
-                    break
-        self.trade_note_var.set(f"Trade idea: {idea['match']} with {idea['partner']}")
-        self.workspace.select(self.trade_tab)
-        self._update_trade_review()
+        match = self.trade_target_matches.get(selection[0])
+        if match:
+            self._load_trade_match(match, "Trade Target suggestion")
 
     def _load_saved_trades(self):
         #Read proposals saved for each league; absent or invalid data starts as an empty list.

@@ -1245,7 +1245,7 @@ class InsightsFeatures:
             self._refresh_trade_builder_values()
             self._populate_trade_rosters()
             self._refresh_saved_trades_view()
-            self._refresh_trade_ideas()
+            self._refresh_trade_target_players()
             self._refresh_weekly_waivers()
             self._refresh_value_trends()
             if error:
